@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,7 +23,7 @@ import (
 const (
 	keeperUsageURL         = "https://chatgpt.com/backend-api/wham/usage"
 	keeperLogFilePrefix    = "codex-keeper-"
-	keeperLogLogger        = "app.services.codex_keeper_service"
+	keeperLogComponent     = "codex_keeper"
 	keeperLogRetainedFiles = 3
 	keeperMaxInMemoryLogs  = 300
 )
@@ -415,7 +416,19 @@ func appendKeeperLog(logs []string, line string) []string {
 }
 
 func formatKeeperLogLine(timestamp time.Time, message string) string {
-	return fmt.Sprintf("%s - %s - INFO - %s", timestamp.In(appTimeLocation).Format("2006-01-02 15:04:05,000"), keeperLogLogger, message)
+	var output strings.Builder
+	handler := slog.NewTextHandler(&output, &slog.HandlerOptions{
+		ReplaceAttr: func(groups []string, attr slog.Attr) slog.Attr {
+			if len(groups) == 0 && attr.Key == slog.TimeKey {
+				return slog.String(slog.TimeKey, timestamp.In(appTimeLocation).Format("2006-01-02T15:04:05.000Z07:00"))
+			}
+			return attr
+		},
+	})
+	record := slog.NewRecord(timestamp.In(appTimeLocation), slog.LevelInfo, message, 0)
+	record.AddAttrs(slog.String("component", keeperLogComponent))
+	_ = handler.Handle(context.Background(), record)
+	return strings.TrimSuffix(output.String(), "\n")
 }
 
 type keeperLogFile struct {
@@ -720,7 +733,7 @@ func keeperAccountResponses(accounts []keeperAccount) []keeperAccountResponse {
 			Email:                account.Email,
 			AccountType:          account.AccountType,
 			Disabled:             account.Disabled,
-			Priority:             account.Priority,
+			Priority:             keeperDisplayPriority(account.Priority),
 			PrimaryUsedPercent:   account.PrimaryUsedPercent,
 			SecondaryUsedPercent: account.SecondaryUsedPercent,
 			PrimaryResetAt:       apiDateTimePtr(account.PrimaryResetAt),
@@ -1011,24 +1024,21 @@ type keeperPriorityPolicyAction struct {
 func (a *App) applyKeeperPriorityPolicy(ctx context.Context, cfg AppConfig, name string, accountType *string, priority *int, restorePriority *int, usage keeperUsageInfo) *keeperPriorityPolicyAction {
 	quotaReached := usage.PrimaryUsedPercent >= cfg.CodexKeeper.QuotaThreshold ||
 		(usage.SecondaryUsedPercent != nil && *usage.SecondaryUsedPercent >= cfg.CodexKeeper.QuotaThreshold)
-	currentPriority := priority
+	currentPriority := keeperEffectivePriority(priority)
 	next := keeperPriorityForType(accountType, cfg.CodexKeeperPriorityRule)
 	if quotaReached {
-		if currentPriority != nil && *currentPriority <= -1 {
+		if currentPriority <= -1 {
 			return nil
 		}
 		restoreTo := restorePriority
 		if restoreTo == nil {
 			restoreTo = next
 		}
-		if currentPriority != nil && *currentPriority > 20 {
-			restoreTo = currentPriority
+		if currentPriority > 20 {
+			restoreTo = &currentPriority
 		}
 		if restoreTo == nil {
-			restoreTo = currentPriority
-		}
-		if restoreTo == nil {
-			return nil
+			restoreTo = &currentPriority
 		}
 		message := fmt.Sprintf("降为低优先级：额度使用率达到阈值 %d%%", cfg.CodexKeeper.QuotaThreshold)
 		if cfg.CodexKeeper.DryRun {
@@ -1043,13 +1053,14 @@ func (a *App) applyKeeperPriorityPolicy(ctx context.Context, cfg AppConfig, name
 		}
 		return &keeperPriorityPolicyAction{Message: message, Result: "priority_degraded", Priority: &low, RestorePriority: restoreTo}
 	}
-	if currentPriority != nil && *currentPriority == -1 {
+	if currentPriority == -1 {
 		restoreTo := restorePriority
 		if restoreTo == nil {
 			restoreTo = next
 		}
 		if restoreTo == nil {
-			return nil
+			zero := 0
+			restoreTo = &zero
 		}
 		message := fmt.Sprintf("恢复优先级：priority %d", *restoreTo)
 		if cfg.CodexKeeper.DryRun {
@@ -1062,13 +1073,13 @@ func (a *App) applyKeeperPriorityPolicy(ctx context.Context, cfg AppConfig, name
 		}
 		return &keeperPriorityPolicyAction{Message: message, Result: "priority_restored", Priority: restoreTo}
 	}
-	if currentPriority != nil && (*currentPriority < -1 || *currentPriority > 20) {
+	if currentPriority < -1 || currentPriority > 20 {
 		return nil
 	}
 	if next == nil {
 		return nil
 	}
-	if currentPriority == nil || *currentPriority != *next {
+	if currentPriority != *next {
 		message := fmt.Sprintf("应用类型优先级：%s -> priority %d", valueOr(accountType, "unknown"), *next)
 		if cfg.CodexKeeper.DryRun {
 			message = "模拟" + message
@@ -1081,6 +1092,21 @@ func (a *App) applyKeeperPriorityPolicy(ctx context.Context, cfg AppConfig, name
 		return &keeperPriorityPolicyAction{Message: message, Result: "priority_restored", Priority: next}
 	}
 	return nil
+}
+
+func keeperEffectivePriority(priority *int) int {
+	if priority == nil {
+		return 0
+	}
+	return *priority
+}
+
+func keeperDisplayPriority(priority *int) *int {
+	if priority != nil {
+		return priority
+	}
+	zero := 0
+	return &zero
 }
 
 func (a *App) mergeKeeperStats(stats *keeperStats, result keeperAccountResult) {

@@ -177,7 +177,7 @@ func TestKeeperStatusRestoresRecentLogFileLines(t *testing.T) {
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		t.Fatalf("create log dir: %v", err)
 	}
-	expected := "2026-05-16 16:03:05,571 - app.services.codex_keeper_service - INFO - demo.json: 巡检正常，类型 free"
+	expected := `time=2026-05-16T16:03:05.571+08:00 level=INFO msg="demo.json: 巡检正常，类型 free" component=codex_keeper`
 	if err := os.WriteFile(filepath.Join(logDir, "codex-keeper-2026-05-16.log"), []byte(expected+"\n"), 0o644); err != nil {
 		t.Fatalf("write keeper log fixture: %v", err)
 	}
@@ -378,7 +378,6 @@ func TestKeeperRunMaintainsSystemPriorityRules(t *testing.T) {
 
 	mu.Lock()
 	expectedPatches := map[string][]int{
-		"free-null.json":         {0},
 		"free-quota-null.json":   {-1},
 		"plus-wrong.json":        {4},
 		"manual-quota-high.json": {-1},
@@ -446,6 +445,9 @@ func TestKeeperAccountsReturnBeijingOffsetTimeStrings(t *testing.T) {
 	item := response.Items[0]
 	if item.Name != "sample.json" {
 		t.Fatalf("account name = %q, want sample.json", item.Name)
+	}
+	if item.Priority == nil || *item.Priority != 0 {
+		t.Fatalf("priority = %v, want 0 when stored value is NULL", item.Priority)
 	}
 	if got := stringPtrValue(item.LastCheckedAt); got != "2026-05-13T12:00:01+08:00" {
 		t.Fatalf("last_checked_at = %q, want Beijing offset time", got)
@@ -576,7 +578,7 @@ func TestDBBackedAPIsReturnBeijingOffsetTimeStrings(t *testing.T) {
 
 func assertStandardKeeperLogLine(t *testing.T, line string) {
 	t.Helper()
-	pattern := regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - app\.services\.codex_keeper_service - INFO - .+`)
+	pattern := regexp.MustCompile(`^time=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}\+08:00 level=INFO msg=.+ component=codex_keeper$`)
 	if !pattern.MatchString(line) {
 		t.Fatalf("keeper log line %q does not match standard format", line)
 	}

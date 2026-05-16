@@ -126,13 +126,12 @@ const systemPriorityCount = computed(
     accounts.value.filter(
       (account) =>
         !account.disabled &&
-        account.priority !== null &&
-        account.priority >= -1 &&
-        account.priority <= 20,
+        accountPriority(account) >= -1 &&
+        accountPriority(account) <= 20,
     ).length,
 )
 const highPriorityCount = computed(
-  () => accounts.value.filter((account) => account.priority !== null && account.priority > 20).length,
+  () => accounts.value.filter((account) => accountPriority(account) > 20).length,
 )
 const activeFilterCount = computed(
   () =>
@@ -199,25 +198,29 @@ const priorityModeOptions = computed(() => {
 })
 
 function matchesPriorityFilter(account: CodexKeeperAccount, value: PriorityFilter): boolean {
+  const priority = accountPriority(account)
   if (value === 'high') {
-    return account.priority !== null && account.priority > 20
+    return priority > 20
   }
   if (value === 'minusOne') {
-    return account.priority === -1
+    return priority === -1
   }
   if (value === 'low') {
-    return account.priority !== null && account.priority < -1
+    return priority < -1
   }
   const accountType = priorityTypeFromFilter(value)
   if (accountType !== null) {
     return (
       account.account_type === accountType &&
-      account.priority !== null &&
-      account.priority >= 0 &&
-      account.priority <= 20
+      priority >= 0 &&
+      priority <= 20
     )
   }
   return true
+}
+
+function accountPriority(account: CodexKeeperAccount): number {
+  return account.priority ?? 0
 }
 
 function priorityTypeFilter(accountType: string): PriorityTypeFilter {
@@ -450,10 +453,11 @@ function openDetail(account: CodexKeeperAccount) {
 
 function openPriorityDialog(account: CodexKeeperAccount) {
   priorityDialog.account = account
+  const priority = accountPriority(account)
   const mode =
-    account.priority !== null && account.priority < -1
+    priority < -1
       ? 'low'
-      : account.priority !== null && account.priority > 20
+      : priority > 20
         ? 'high'
         : 'default'
   setPriorityDialogMode(defaultPriority(account) === null && mode === 'default' ? 'low' : mode)
@@ -468,11 +472,13 @@ function setPriorityDialogMode(mode: PriorityMode) {
     return
   }
   if (mode === 'low') {
-    priorityDialog.value = account.priority !== null && account.priority < -1 ? account.priority : -2
+    const priority = accountPriority(account)
+    priorityDialog.value = priority < -1 ? priority : -2
     return
   }
   if (mode === 'high') {
-    priorityDialog.value = account.priority !== null && account.priority > 20 ? account.priority : 21
+    const priority = accountPriority(account)
+    priorityDialog.value = priority > 20 ? priority : 21
     return
   }
   priorityDialog.value = defaultPriority(account)
@@ -560,7 +566,7 @@ const baseColumns: DataTableColumns<CodexKeeperAccount> = [
     title: '优先级',
     key: 'priority',
     width: 88,
-    render: (row) => (row.priority === null ? '-' : formatInteger(row.priority)),
+    render: (row) => formatInteger(accountPriority(row)),
   },
   {
     title: '额度窗口',
@@ -921,7 +927,7 @@ onMounted(loadAccounts)
             {{ selectedAccount.disabled ? '已禁用' : '启用中' }}
           </NDescriptionsItem>
           <NDescriptionsItem label="当前优先级">
-            {{ selectedAccount.priority ?? '-' }}
+            {{ accountPriority(selectedAccount) }}
           </NDescriptionsItem>
           <NDescriptionsItem label="类型默认优先级">
             {{ defaultPriority(selectedAccount) ?? '-' }}

@@ -46,9 +46,9 @@ import { formatDateTime, formatInteger } from '@/shared/utils/format'
 type LogTone = 'danger' | 'debug' | 'default' | 'info' | 'warning'
 
 interface ParsedLogLine {
+  component: string
   key: string
   level: string
-  logger: string
   message: string
   raw: string
   time: string
@@ -85,9 +85,14 @@ const isDaemonRunning = computed(() => status.value?.daemon_running === true)
 const statusLogs = computed(() =>
   Array.isArray(status.value?.logs) ? status.value.logs : [],
 )
-const logText = computed(() => statusLogs.value.join('\n'))
+const parsedLogLines = computed(() =>
+  statusLogs.value
+    .map((line, index) => parseLogLine(line, index))
+    .filter((line): line is ParsedLogLine => line !== null),
+)
+const logText = computed(() => parsedLogLines.value.map((line) => line.raw).join('\n'))
 const displayedLogLines = computed(() =>
-  statusLogs.value.map((line, index) => parseLogLine(line, index)).reverse(),
+  [...parsedLogLines.value].reverse(),
 )
 const displayedPriorityRules = computed(() =>
   [...priorityRules.value].sort((left, right) => {
@@ -282,27 +287,79 @@ function logTone(level: string): LogTone {
   return 'default'
 }
 
-function parseLogLine(line: string, index: number): ParsedLogLine {
-  const match = /^(.+?) - (.+?) - ([A-Z]+) - (.*)$/.exec(line)
-  if (!match) {
-    return {
-      key: `${index}-${line}`,
-      level: 'RAW',
-      logger: '',
-      message: line,
-      raw: line,
-      time: '-',
-      tone: 'default',
+function parseSlogFields(line: string): Record<string, string> | null {
+  const fields: Record<string, string> = {}
+  let cursor = 0
+  while (cursor < line.length) {
+    while (line[cursor] === ' ') {
+      cursor += 1
     }
+    if (cursor >= line.length) {
+      break
+    }
+    const keyStart = cursor
+    while (cursor < line.length && line[cursor] !== '=' && line[cursor] !== ' ') {
+      cursor += 1
+    }
+    if (cursor >= line.length || line[cursor] !== '=') {
+      return null
+    }
+    const key = line.slice(keyStart, cursor)
+    cursor += 1
+
+    let value = ''
+    if (line[cursor] === '"') {
+      cursor += 1
+      let escaped = false
+      while (cursor < line.length) {
+        const char = line[cursor]
+        cursor += 1
+        if (escaped) {
+          value += char
+          escaped = false
+          continue
+        }
+        if (char === '\\') {
+          escaped = true
+          continue
+        }
+        if (char === '"') {
+          break
+        }
+        value += char
+      }
+    } else {
+      const valueStart = cursor
+      while (cursor < line.length && line[cursor] !== ' ') {
+        cursor += 1
+      }
+      value = line.slice(valueStart, cursor)
+    }
+    fields[key] = value
   }
-  const time = match[1] ?? '-'
-  const logger = match[2] ?? ''
-  const level = match[3] ?? 'RAW'
-  const logMessage = match[4] ?? ''
+  return fields.time && fields.level && fields.msg ? fields : null
+}
+
+function parseLogLine(line: string, index: number): ParsedLogLine | null {
+  const fields = parseSlogFields(line)
+  if (!fields) {
+    return null
+  }
+  const time = fields.time
+  const level = fields.level
+  const messageText = fields.msg
+  if (!time || !level || !messageText) {
+    return null
+  }
+  const component = fields.component ?? '-'
+  const extraFields = Object.entries(fields)
+    .filter(([key]) => !['time', 'level', 'component', 'msg'].includes(key))
+    .map(([key, value]) => `${key}=${value}`)
+  const logMessage = [messageText, ...extraFields].filter(Boolean).join(' ')
   return {
+    component,
     key: `${index}-${line}`,
     level,
-    logger,
     message: logMessage,
     raw: line,
     time,
@@ -659,7 +716,7 @@ onBeforeUnmount(() => {
             >
               <time class="log-time">{{ line.time }}</time>
               <span class="log-level">{{ line.level }}</span>
-              <span class="log-logger">{{ line.logger || '-' }}</span>
+              <span class="log-component">{{ line.component }}</span>
               <span class="log-message">{{ line.message }}</span>
             </div>
           </div>
@@ -1007,13 +1064,13 @@ onBeforeUnmount(() => {
 
 .log-lines {
   display: grid;
-  min-width: 980px;
+  min-width: 860px;
   padding: 8px;
 }
 
 .log-line {
   display: grid;
-  grid-template-columns: 190px 68px minmax(210px, 280px) minmax(0, 1fr);
+  grid-template-columns: 216px 68px minmax(112px, 148px) minmax(0, 1fr);
   gap: 10px;
   align-items: start;
   min-width: 0;
@@ -1039,13 +1096,13 @@ onBeforeUnmount(() => {
 }
 
 .log-time,
-.log-logger,
+.log-component,
 .log-message {
   min-width: 0;
 }
 
 .log-time,
-.log-logger {
+.log-component {
   overflow: hidden;
   color: var(--cpa-text-muted);
   text-overflow: ellipsis;
