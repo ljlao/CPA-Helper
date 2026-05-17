@@ -1,9 +1,11 @@
 package app_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	backendApp "cpa-helper/backend/internal/app"
@@ -12,6 +14,71 @@ import (
 type apiKeyCreateResponse struct {
 	APIKey     string `json:"api_key"`
 	APIKeyHash string `json:"api_key_hash"`
+}
+
+func TestListAPIKeysReturnsEmptyArrayForFreshAccount(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	app, err := backendApp.New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "Admin",
+	}, nil, nil)
+
+	var keys []apiKeyCreateResponse
+	requestJSON(t, handler, http.MethodGet, "/api/api-keys", nil, cookies, &keys)
+	if keys == nil {
+		t.Fatal("fresh API key list decoded as nil; want empty JSON array")
+	}
+	if len(keys) != 0 {
+		t.Fatalf("fresh API key list length = %d, want 0", len(keys))
+	}
+}
+
+func TestCreateAPIKeyWithoutCPAConfigGuidesToSettings(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	app, err := backendApp.New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "Admin",
+	}, nil, nil)
+
+	body, err := json.Marshal(map[string]any{"description": "VSCode"})
+	if err != nil {
+		t.Fatalf("marshal request body: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/api-keys", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("POST /api/api-keys returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	message := recorder.Body.String()
+	if !strings.Contains(message, "CPA 配置未完成") ||
+		!strings.Contains(message, "系统设置") ||
+		!strings.Contains(message, "CLIProxyAPI 地址和管理密钥") {
+		t.Fatalf("missing actionable CPA config guidance in response: %s", message)
+	}
 }
 
 func TestCreateAPIKeyUsesPatchAppendWhenRemoteListIsEmpty(t *testing.T) {

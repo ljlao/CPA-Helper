@@ -5,8 +5,12 @@ import type {
   UserApiKeySummary,
 } from '@/shared/types/api'
 
+function toApiKeyList(value: unknown): UserApiKeySummary[] {
+  return Array.isArray(value) ? (value as UserApiKeySummary[]) : []
+}
+
 export function listApiKeys(): Promise<UserApiKeySummary[]> {
-  return apiClient.get<UserApiKeySummary[]>('/api-keys')
+  return apiClient.get<unknown>('/api-keys').then(toApiKeyList)
 }
 
 export function createApiKey(payload: ApiKeyCreatePayload): Promise<UserApiKeySummary> {

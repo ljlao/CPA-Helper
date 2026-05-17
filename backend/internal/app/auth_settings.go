@@ -29,6 +29,8 @@ type changeCredentialsRequest struct {
 
 var apiKeySyncTimeout = 8 * time.Second
 
+const apiKeySyncMissingConfigMessage = "CPA 配置未完成：请先到「系统设置」填写 CLIProxyAPI 地址和管理密钥，再返回 API 密钥页操作。"
+
 func (a *App) handleAuth(w http.ResponseWriter, r *http.Request) error {
 	path := strings.TrimPrefix(r.URL.Path, "/api/auth")
 	switch path {
@@ -407,7 +409,7 @@ func (a *App) addRemoteAPIKey(ctx context.Context, apiKey string) error {
 		return err
 	}
 	if strings.TrimSpace(cfg.Collector.ManagementKey) == "" {
-		return validationError("管理密钥未设置，无法同步 CPA API KEY")
+		return validationError(apiKeySyncMissingConfigMessage)
 	}
 	syncCtx, cancel := context.WithTimeout(ctx, apiKeySyncTimeout)
 	defer cancel()
@@ -437,7 +439,7 @@ func (a *App) removeRemoteAPIKeyHash(ctx context.Context, apiKeyHash string) err
 		return err
 	}
 	if strings.TrimSpace(cfg.Collector.ManagementKey) == "" {
-		return validationError("管理密钥未设置，无法同步 CPA API KEY")
+		return validationError(apiKeySyncMissingConfigMessage)
 	}
 	syncCtx, cancel := context.WithTimeout(ctx, apiKeySyncTimeout)
 	defer cancel()

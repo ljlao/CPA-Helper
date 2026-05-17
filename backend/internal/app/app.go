@@ -592,11 +592,14 @@ func apiJSONReflectValue(value reflect.Value) any {
 		}
 		return result
 	case reflect.Slice, reflect.Array:
-		if value.Kind() == reflect.Slice && value.IsNil() {
-			return nil
-		}
 		if value.Type().Elem().Kind() == reflect.Uint8 {
+			if value.Kind() == reflect.Slice && value.IsNil() {
+				return nil
+			}
 			return value.Interface()
+		}
+		if value.Kind() == reflect.Slice && value.IsNil() {
+			return []any{}
 		}
 		result := make([]any, 0, value.Len())
 		for i := 0; i < value.Len(); i++ {
