@@ -314,9 +314,8 @@ func (r *KeeperRunner) ClearLogs() {
 
 func (r *KeeperRunner) Status() keeperStatusResponse {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	logs := append([]string{}, r.logs...)
-	return keeperStatusResponse{
+	response := keeperStatusResponse{
 		Running:        r.running,
 		DaemonRunning:  r.daemonRunningLocked(),
 		State:          r.state,
@@ -327,6 +326,14 @@ func (r *KeeperRunner) Status() keeperStatusResponse {
 		Stats:          r.stats,
 		Logs:           logs,
 	}
+	r.mu.Unlock()
+	if r.app != nil {
+		response.Stats = keeperStats{}
+		if run, err := r.app.latestKeeperRunByMode(context.Background(), "daemon"); err == nil && run != nil {
+			response.Stats = run.Stats
+		}
+	}
+	return response
 }
 
 func (r *KeeperRunner) daemonRunningLocked() bool {
@@ -946,6 +953,7 @@ type keeperRunOptions struct {
 	AuthNames       []string
 	ManualRefresh   bool
 	UseRefreshCache bool
+	PersistRun      bool
 }
 
 func (a *App) executeKeeperRunForAccounts(ctx context.Context, mode string, authNames []string, logFn func(string)) (keeperStats, string, error) {
@@ -954,7 +962,12 @@ func (a *App) executeKeeperRunForAccounts(ctx context.Context, mode string, auth
 		AuthNames:       authNames,
 		ManualRefresh:   mode == "accounts",
 		UseRefreshCache: mode == "daemon" || mode == "conditional",
+		PersistRun:      keeperModePersistsRun(mode),
 	}, logFn)
+}
+
+func keeperModePersistsRun(mode string) bool {
+	return mode != "accounts" && mode != "conditional"
 }
 
 func (a *App) executeKeeperRunWithOptions(ctx context.Context, options keeperRunOptions, logFn func(string)) (keeperStats, string, error) {
@@ -965,13 +978,18 @@ func (a *App) executeKeeperRunWithOptions(ctx context.Context, options keeperRun
 	if strings.TrimSpace(cfg.Collector.ManagementKey) == "" {
 		return keeperStats{}, "", validationError("管理密钥未设置，无法运行 Codex Keeper")
 	}
-	runID, err := a.createKeeperRun(ctx, options.Mode)
-	if err != nil {
-		return keeperStats{}, "", err
+	runID := 0
+	if options.PersistRun {
+		runID, err = a.createKeeperRun(ctx, options.Mode)
+		if err != nil {
+			return keeperStats{}, "", err
+		}
 	}
 	targetNames, err := normalizeOptionalKeeperAuthNames(options.AuthNames)
 	if err != nil {
-		_ = a.finishKeeperRun(ctx, runID, "failed", err.Error(), keeperStats{})
+		if runID > 0 {
+			_ = a.finishKeeperRun(ctx, runID, "failed", err.Error(), keeperStats{})
+		}
 		return keeperStats{}, "", err
 	}
 	targetSet := map[string]bool{}
@@ -989,17 +1007,35 @@ func (a *App) executeKeeperRunWithOptions(ctx context.Context, options keeperRun
 	detail := "巡检完成"
 	authFiles, err := a.listKeeperRemoteAuthFiles(ctx, cfg)
 	if err != nil {
-		_ = a.finishKeeperRun(ctx, runID, "failed", err.Error(), stats)
+		if runID > 0 {
+			_ = a.finishKeeperRun(ctx, runID, "failed", err.Error(), stats)
+		}
 		return stats, "", err
 	}
 	filtered := make([]map[string]any, 0, len(authFiles))
+	remoteCodexNames := map[string]bool{}
 	for _, item := range authFiles {
 		if keeperString(item["type"]) != "codex" {
 			continue
 		}
 		name := keeperString(item["name"])
+		if name != "" {
+			remoteCodexNames[name] = true
+		}
 		if len(targetSet) == 0 || targetSet[name] {
 			filtered = append(filtered, item)
+		}
+	}
+	if len(targetSet) == 0 {
+		pruned, err := a.pruneKeeperMissingAuthStates(ctx, remoteCodexNames)
+		if err != nil {
+			if runID > 0 {
+				_ = a.finishKeeperRun(ctx, runID, "failed", err.Error(), stats)
+			}
+			return stats, "", err
+		}
+		if pruned > 0 {
+			logFn(fmt.Sprintf("清理本地已不存在的 Codex 账号 %d 个", pruned))
 		}
 	}
 	stats.Total = len(filtered)
@@ -1007,7 +1043,9 @@ func (a *App) executeKeeperRunWithOptions(ctx context.Context, options keeperRun
 		var skipped int
 		filtered, skipped, err = a.filterKeeperCachedAuthItems(ctx, filtered, cfg)
 		if err != nil {
-			_ = a.finishKeeperRun(ctx, runID, "failed", err.Error(), stats)
+			if runID > 0 {
+				_ = a.finishKeeperRun(ctx, runID, "failed", err.Error(), stats)
+			}
 			return stats, "", err
 		}
 		stats.Skipped += skipped
@@ -1020,14 +1058,18 @@ func (a *App) executeKeeperRunWithOptions(ctx context.Context, options keeperRun
 		} else {
 			detail = "未发现 Codex auth file"
 		}
-		_ = a.finishKeeperRun(ctx, runID, "completed", detail, stats)
+		if runID > 0 {
+			_ = a.finishKeeperRun(ctx, runID, "completed", detail, stats)
+		}
 		return stats, detail, nil
 	}
 	for _, item := range filtered {
 		result := a.processKeeperAuth(ctx, cfg, item, logFn, options.ManualRefresh)
 		a.mergeKeeperStats(&stats, result)
-		if err := a.recordKeeperRunAccount(ctx, runID, result); err != nil {
-			logFn("写入巡检账号历史失败：" + err.Error())
+		if runID > 0 {
+			if err := a.recordKeeperRunAccount(ctx, runID, result); err != nil {
+				logFn("写入巡检账号历史失败：" + err.Error())
+			}
 		}
 	}
 	if options.Mode == "conditional" {
@@ -1037,7 +1079,9 @@ func (a *App) executeKeeperRunWithOptions(ctx context.Context, options keeperRun
 	} else {
 		detail = fmt.Sprintf("巡检完成：健康 %d，坏凭证禁用 %d，优先级降级 %d，网络错误 %d，缓存跳过 %d", stats.Healthy, stats.StatusDisabled, stats.PriorityDegraded, stats.NetworkError, stats.Skipped)
 	}
-	_ = a.finishKeeperRun(ctx, runID, "completed", detail, stats)
+	if runID > 0 {
+		_ = a.finishKeeperRun(ctx, runID, "completed", detail, stats)
+	}
 	return stats, detail, nil
 }
 
@@ -1805,6 +1849,56 @@ func (a *App) listKeeperAccounts(ctx context.Context) ([]keeperAccount, error) {
 	return accounts, rows.Err()
 }
 
+func (a *App) pruneKeeperMissingAuthStates(ctx context.Context, remoteNames map[string]bool) (int, error) {
+	rows, err := a.db.QueryContext(ctx, `SELECT auth_name FROM codex_keeper_auth_states`)
+	if err != nil {
+		return 0, err
+	}
+	stale := []string{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		if !remoteNames[name] {
+			stale = append(stale, name)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if len(stale) == 0 {
+		return 0, nil
+	}
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.PrepareContext(ctx, `DELETE FROM codex_keeper_auth_states WHERE auth_name = ?`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+	pruned := 0
+	for _, name := range stale {
+		result, err := stmt.ExecContext(ctx, name)
+		if err != nil {
+			return 0, err
+		}
+		affected, _ := result.RowsAffected()
+		pruned += int(affected)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return pruned, nil
+}
+
 func (a *App) getKeeperState(ctx context.Context, name string) (*keeperAuthState, error) {
 	rows, err := a.db.QueryContext(ctx, `
 		SELECT auth_name, email, account_type, disabled, priority, primary_used_percent,
@@ -2036,6 +2130,21 @@ func (a *App) latestKeeperRun(ctx context.Context) (*keeperRunRecord, error) {
 		       status_enabled, priority_degraded, priority_restored, skipped, network_error
 		FROM codex_keeper_runs ORDER BY id DESC LIMIT 1
 	`)
+	return scanKeeperRunRecord(row)
+}
+
+func (a *App) latestKeeperRunByMode(ctx context.Context, mode string) (*keeperRunRecord, error) {
+	row := a.db.QueryRowContext(ctx, `
+		SELECT mode, state, detail, CAST(started_at AS TEXT), CAST(finished_at AS TEXT), total, healthy, status_disabled,
+		       status_enabled, priority_degraded, priority_restored, skipped, network_error
+		FROM codex_keeper_runs WHERE mode = ? ORDER BY id DESC LIMIT 1
+	`, mode)
+	return scanKeeperRunRecord(row)
+}
+
+func scanKeeperRunRecord(row interface {
+	Scan(dest ...any) error
+}) (*keeperRunRecord, error) {
 	var run keeperRunRecord
 	var mode, startedAt, finishedAt sql.NullString
 	err := row.Scan(&mode, &run.State, &run.Detail, &startedAt, &finishedAt, &run.Stats.Total, &run.Stats.Healthy, &run.Stats.StatusDisabled, &run.Stats.StatusEnabled, &run.Stats.PriorityDegraded, &run.Stats.PriorityRestored, &run.Stats.Skipped, &run.Stats.NetworkError)

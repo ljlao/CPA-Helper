@@ -170,6 +170,12 @@ func TestAutomaticKeeperRunsRespectCacheButManualRefreshBypasses(t *testing.T) {
 	if usageCalls != 1 {
 		t.Fatalf("manual usage calls = %d, want 1", usageCalls)
 	}
+	if got := countKeeperRows(t, app, `SELECT COUNT(*) FROM codex_keeper_runs`); got != 1 {
+		t.Fatalf("keeper run rows = %d, want 1 because account refresh is not persisted", got)
+	}
+	if got := countKeeperRows(t, app, `SELECT COUNT(*) FROM codex_keeper_run_accounts`); got != 0 {
+		t.Fatalf("keeper run account rows = %d, want 0 because skipped daemon and manual refresh are not persisted", got)
+	}
 }
 
 func TestConditionalKeeperRunUsesAutomaticPriorityPolicy(t *testing.T) {
@@ -242,6 +248,105 @@ func TestConditionalKeeperRunUsesAutomaticPriorityPolicy(t *testing.T) {
 	}
 	if len(priorityPatches) != 1 || priorityPatches[0] != -1 {
 		t.Fatalf("priority patches = %#v, want [-1]", priorityPatches)
+	}
+	if got := countKeeperRows(t, app, `SELECT COUNT(*) FROM codex_keeper_runs`); got != 0 {
+		t.Fatalf("keeper run rows = %d, want 0 because conditional refresh is not persisted", got)
+	}
+}
+
+func TestFullKeeperRunPrunesLocalStatesMissingFromCPA(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"files": []map[string]any{{"name": "kept.json", "type": "codex"}},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name":         "kept.json",
+				"type":         "codex",
+				"account_type": "free",
+				"disabled":     false,
+				"priority":     0,
+				"access_token": "test-token",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status_code": 200,
+				"body": map[string]any{
+					"plan_type": "free",
+					"rate_limit": map[string]any{
+						"primary_window": map[string]any{"used_percent": 10, "reset_after_seconds": 3600},
+					},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+	insertKeeperStateForCandidate(t, app, "kept.json", nil, nil)
+	insertKeeperStateForCandidate(t, app, "stale.json", nil, nil)
+
+	if _, _, err := app.executeKeeperRunForAccounts(context.Background(), "daemon", nil, func(string) {}); err != nil {
+		t.Fatalf("daemon run: %v", err)
+	}
+	if got := countKeeperRows(t, app, `SELECT COUNT(*) FROM codex_keeper_auth_states WHERE auth_name = 'kept.json'`); got != 1 {
+		t.Fatalf("kept state rows = %d, want 1", got)
+	}
+	if got := countKeeperRows(t, app, `SELECT COUNT(*) FROM codex_keeper_auth_states WHERE auth_name = 'stale.json'`); got != 0 {
+		t.Fatalf("stale state rows = %d, want 0", got)
+	}
+}
+
+func TestKeeperStatusStatsUseLatestDaemonRunOnly(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+	daemonRunID, err := app.createKeeperRun(ctx, "daemon")
+	if err != nil {
+		t.Fatalf("create daemon run: %v", err)
+	}
+	if err := app.finishKeeperRun(ctx, daemonRunID, "completed", "daemon", keeperStats{
+		Total:          7,
+		Healthy:        6,
+		StatusDisabled: 1,
+	}); err != nil {
+		t.Fatalf("finish daemon run: %v", err)
+	}
+	onceRunID, err := app.createKeeperRun(ctx, "once")
+	if err != nil {
+		t.Fatalf("create once run: %v", err)
+	}
+	if err := app.finishKeeperRun(ctx, onceRunID, "completed", "once", keeperStats{
+		Total:            2,
+		Healthy:          1,
+		NetworkError:     1,
+		PriorityRestored: 1,
+	}); err != nil {
+		t.Fatalf("finish once run: %v", err)
+	}
+
+	app.keeper.LoadPersistedState(ctx)
+	status := app.keeper.Status()
+	if status.Stats.Total != 7 || status.Stats.Healthy != 6 || status.Stats.StatusDisabled != 1 || status.Stats.NetworkError != 0 {
+		t.Fatalf("status stats = %#v, want latest daemon stats only", status.Stats)
 	}
 }
 
@@ -316,6 +421,15 @@ func stringPtr(value string) *string {
 
 func timePtrValue(value time.Time) *time.Time {
 	return &value
+}
+
+func countKeeperRows(t *testing.T, app *App, query string) int {
+	t.Helper()
+	var count int
+	if err := app.db.QueryRow(query).Scan(&count); err != nil {
+		t.Fatalf("count rows with %q: %v", query, err)
+	}
+	return count
 }
 
 func assertStringSet(t *testing.T, got []string, want []string) {

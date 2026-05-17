@@ -1036,12 +1036,12 @@ func TestKeeperRefreshDisabledAccountChecksUsageAndRecordsBadCredential(t *testi
 		t.Fatalf("open sqlite db: %v", err)
 	}
 	defer db.Close()
-	var statusDisabled, skipped int
-	if err := db.QueryRow(`SELECT status_disabled, skipped FROM codex_keeper_runs ORDER BY id DESC LIMIT 1`).Scan(&statusDisabled, &skipped); err != nil {
-		t.Fatalf("read latest keeper run stats: %v", err)
+	var runCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM codex_keeper_runs`).Scan(&runCount); err != nil {
+		t.Fatalf("read keeper run count: %v", err)
 	}
-	if statusDisabled != 1 || skipped != 0 {
-		t.Fatalf("latest keeper run stats status_disabled=%d skipped=%d, want 1/0", statusDisabled, skipped)
+	if runCount != 0 {
+		t.Fatalf("keeper run count = %d, want 0 because account refresh is not persisted", runCount)
 	}
 
 	mu.Lock()
