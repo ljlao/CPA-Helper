@@ -549,7 +549,7 @@ function compareNormalAccounts(left: CodexKeeperAccount, right: CodexKeeperAccou
   if (priorityDiff !== 0) {
     return priorityDiff
   }
-  return (left.email ?? left.name).localeCompare(right.email ?? right.name)
+  return compareAccountFileName(left, right)
 }
 
 function sortAccountsForDisplay(
@@ -594,7 +594,7 @@ function compareAccountsByActiveSort(left: CodexKeeperAccount, right: CodexKeepe
     default:
       result = 0
   }
-  return result === 0 ? accountIdentityText(left).localeCompare(accountIdentityText(right)) : result
+  return result === 0 ? compareAccountFileName(left, right) : result
 }
 
 function compareNullableNumber(
@@ -641,8 +641,8 @@ function timestampValue(value: string | null): number | null {
   return Number.isNaN(timestamp) ? null : timestamp
 }
 
-function accountIdentityText(account: CodexKeeperAccount): string {
-  return account.email ?? account.name
+function compareAccountFileName(left: CodexKeeperAccount, right: CodexKeeperAccount): number {
+  return left.name.localeCompare(right.name)
 }
 
 function defaultPriority(account: CodexKeeperAccount): number | null {
