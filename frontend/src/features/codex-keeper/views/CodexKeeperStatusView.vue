@@ -12,6 +12,7 @@ import {
   NInput,
   NInputNumber,
   NModal,
+  NPagination,
   NSelect,
   NSpace,
   NTag,
@@ -105,6 +106,9 @@ const refreshSelectMode = ref(false)
 const selectedRefreshAccountNames = ref<string[]>([])
 const detailOpen = ref(false)
 const accountDisplaySize = ref<AccountDisplaySize>(50)
+const disabledAccountPage = ref(1)
+const normalAccountPage = ref(1)
+const cardAccountPage = ref(1)
 const accountListViewMode = ref<AccountListViewMode>('table')
 const filters = reactive({
   keyword: '',
@@ -254,27 +258,63 @@ const disabledTableDisplayProps = computed(() =>
 const normalTableDisplayProps = computed(() =>
   accountTableDisplayProps(visibleNormalAccounts.value.length),
 )
-const displayLimit = computed(() =>
-  accountDisplaySize.value === 'all' ? Number.POSITIVE_INFINITY : accountDisplaySize.value,
+const accountPaginationPageSize = computed(() =>
+  accountDisplaySize.value === 'all' ? 1 : accountDisplaySize.value,
+)
+const disabledAccountPageCount = computed(() => accountPageCount(filteredDisabledAccounts.value.length))
+const normalAccountPageCount = computed(() => accountPageCount(filteredNormalAccounts.value.length))
+const cardAccountPageCount = computed(() => accountPageCount(sortedCardAccounts.value.length))
+const showDisabledPagination = computed(() =>
+  shouldShowAccountPagination(filteredDisabledAccounts.value.length),
+)
+const showNormalPagination = computed(() =>
+  shouldShowAccountPagination(filteredNormalAccounts.value.length),
+)
+const showCardPagination = computed(() =>
+  shouldShowAccountPagination(sortedCardAccounts.value.length),
 )
 const visibleDisabledAccounts = computed(() =>
-  filteredDisabledAccounts.value.slice(0, displayLimit.value),
+  pagedAccounts(filteredDisabledAccounts.value, disabledAccountPage.value),
 )
 const visibleNormalAccounts = computed(() =>
-  filteredNormalAccounts.value.slice(0, displayLimit.value),
+  pagedAccounts(filteredNormalAccounts.value, normalAccountPage.value),
 )
 const visibleCardAccounts = computed(() =>
-  sortedCardAccounts.value.slice(0, displayLimit.value),
+  pagedAccounts(sortedCardAccounts.value, cardAccountPage.value),
+)
+const disabledSectionDisplayText = computed(() =>
+  accountDisplayText(
+    visibleDisabledAccounts.value.length,
+    filteredDisabledAccounts.value.length,
+    disabledAccountPage.value,
+    disabledAccountPageCount.value,
+  ),
+)
+const normalSectionDisplayText = computed(() =>
+  accountDisplayText(
+    visibleNormalAccounts.value.length,
+    filteredNormalAccounts.value.length,
+    normalAccountPage.value,
+    normalAccountPageCount.value,
+  ),
+)
+const cardSectionDisplayText = computed(() =>
+  accountDisplayText(
+    visibleCardAccounts.value.length,
+    sortedCardAccounts.value.length,
+    cardAccountPage.value,
+    cardAccountPageCount.value,
+  ),
 )
 const showCardLoadingState = computed(() => isLoading.value && accounts.value.length === 0)
 const displaySizeHelpText = computed(() =>
   isTableView.value
     ? isDisplayAllAccounts.value
       ? '当前筛选结果全部展示，账号较多时自动使用虚拟滚动。'
-      : `每个分组最多显示 ${accountDisplaySize.value} 个账号。`
+      : `每个分组每页显示 ${accountDisplaySize.value} 个账号。`
     : isDisplayAllAccounts.value
       ? '当前筛选结果全部以卡片展示，账号较多时使用轻量渲染优化。'
-      : `统一列表最多显示 ${accountDisplaySize.value} 个账号。`,
+      : `统一列表每页显示 ${accountDisplaySize.value} 个账号。`,
 )
 const activeQuotaSortLabel = computed(() => {
   if (accountSort.key === 'quotaDay') {
@@ -297,6 +337,54 @@ function accountTableDisplayProps(rowCount: number) {
     : {
         virtualScroll: false,
       }
+}
+
+function accountPageCount(rowCount: number): number {
+  if (accountDisplaySize.value === 'all') {
+    return 1
+  }
+  return Math.max(1, Math.ceil(rowCount / accountDisplaySize.value))
+}
+
+function shouldShowAccountPagination(rowCount: number): boolean {
+  return accountDisplaySize.value !== 'all' && rowCount > accountDisplaySize.value
+}
+
+function pagedAccounts(source: CodexKeeperAccount[], page: number): CodexKeeperAccount[] {
+  if (accountDisplaySize.value === 'all') {
+    return source
+  }
+  const safePage = clampPage(page, accountPageCount(source.length))
+  const start = (safePage - 1) * accountDisplaySize.value
+  return source.slice(start, start + accountDisplaySize.value)
+}
+
+function accountDisplayText(
+  visibleCount: number,
+  totalCount: number,
+  page: number,
+  pageCount: number,
+): string {
+  if (isDisplayAllAccounts.value) {
+    return `显示 ${visibleCount} / ${totalCount} 个账号`
+  }
+  return `第 ${clampPage(page, pageCount)} / ${pageCount} 页，显示 ${visibleCount} / ${totalCount} 个账号`
+}
+
+function clampPage(page: number, pageCount: number): number {
+  return Math.min(Math.max(1, page), pageCount)
+}
+
+function resetAccountPages() {
+  disabledAccountPage.value = 1
+  normalAccountPage.value = 1
+  cardAccountPage.value = 1
+}
+
+function clampAccountPages() {
+  disabledAccountPage.value = clampPage(disabledAccountPage.value, disabledAccountPageCount.value)
+  normalAccountPage.value = clampPage(normalAccountPage.value, normalAccountPageCount.value)
+  cardAccountPage.value = clampPage(cardAccountPage.value, cardAccountPageCount.value)
 }
 
 function isAccountDisplaySize(value: unknown): value is AccountDisplaySize {
@@ -1563,6 +1651,23 @@ watch(
   [accountDisplaySize, accountListViewMode, () => accountSort.key, () => accountSort.direction],
   saveAccountStatusPreferences,
 )
+watch(
+  [
+    accountDisplaySize,
+    accountListViewMode,
+    () => accountSort.key,
+    () => accountSort.direction,
+    () => filters.keyword,
+    () => filters.accountType,
+    () => filters.priority,
+    () => filters.status,
+  ],
+  resetAccountPages,
+)
+watch(
+  [disabledAccountPageCount, normalAccountPageCount, cardAccountPageCount],
+  clampAccountPages,
+)
 watch(visibleDisabledAccounts, pruneSelectedDisabledAccountKeys)
 watch(filteredAccounts, pruneSelectedRefreshAccountNames)
 
@@ -1793,7 +1898,7 @@ onBeforeUnmount(() => {
             <div class="account-section-title-group">
               <h3 class="account-section-title">已禁用账号</h3>
               <p class="account-section-subtitle">
-                显示 {{ visibleDisabledAccounts.length }} / {{ filteredDisabledAccounts.length }} 个账号
+                {{ disabledSectionDisplayText }}
               </p>
             </div>
             <div class="account-section-actions">
@@ -1827,6 +1932,14 @@ onBeforeUnmount(() => {
               <div class="empty-state">当前筛选下暂无已禁用账号</div>
             </template>
           </NDataTable>
+          <div v-if="showDisabledPagination" class="account-pagination-row">
+            <NPagination
+              v-model:page="disabledAccountPage"
+              size="small"
+              :page-size="accountPaginationPageSize"
+              :item-count="filteredDisabledAccounts.length"
+            />
+          </div>
         </section>
 
         <section v-if="showNormalSection" class="account-section">
@@ -1834,7 +1947,7 @@ onBeforeUnmount(() => {
             <div class="account-section-title-group">
               <h3 class="account-section-title">正常账号</h3>
               <p class="account-section-subtitle">
-                显示 {{ visibleNormalAccounts.length }} / {{ filteredNormalAccounts.length }} 个账号
+                {{ normalSectionDisplayText }}
               </p>
             </div>
           </div>
@@ -1855,6 +1968,14 @@ onBeforeUnmount(() => {
               <div class="empty-state">当前筛选下暂无正常账号</div>
             </template>
           </NDataTable>
+          <div v-if="showNormalPagination" class="account-pagination-row">
+            <NPagination
+              v-model:page="normalAccountPage"
+              size="small"
+              :page-size="accountPaginationPageSize"
+              :item-count="filteredNormalAccounts.length"
+            />
+          </div>
         </section>
       </div>
       <div v-else class="account-card-shell">
@@ -1863,7 +1984,7 @@ onBeforeUnmount(() => {
             <div class="account-section-title-group">
               <h3 class="account-section-title">{{ accountListViewLabel }}</h3>
               <p class="account-section-subtitle">
-                显示 {{ visibleCardAccounts.length }} / {{ sortedCardAccounts.length }} 个账号
+                {{ cardSectionDisplayText }}
               </p>
             </div>
           </div>
@@ -1931,7 +2052,9 @@ onBeforeUnmount(() => {
                 </div>
                 <div class="account-card-meta-item">
                   <span>最近巡检</span>
-                  <strong>{{ formatDateTime(account.last_checked_at) }}</strong>
+                  <strong :title="formatDateTime(account.last_checked_at)">
+                    {{ formatDateTime(account.last_checked_at, { includeSecond: false }) }}
+                  </strong>
                 </div>
               </div>
               <div
@@ -2014,12 +2137,20 @@ onBeforeUnmount(() => {
               </div>
             </button>
           </div>
+          <div v-if="showCardPagination" class="account-pagination-row">
+            <NPagination
+              v-model:page="cardAccountPage"
+              size="small"
+              :page-size="accountPaginationPageSize"
+              :item-count="sortedCardAccounts.length"
+            />
+          </div>
         </section>
       </div>
 
       <div class="display-control-row">
         <div class="display-control-copy">
-          <span class="display-control-label">展示数量</span>
+          <span class="display-control-label">每页数量</span>
           <span class="display-control-help">{{ displaySizeHelpText }}</span>
         </div>
         <NSelect
@@ -2387,6 +2518,7 @@ onBeforeUnmount(() => {
 
 .display-control-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
@@ -2461,6 +2593,17 @@ onBeforeUnmount(() => {
   display: flex;
   flex-shrink: 0;
   align-items: center;
+  justify-content: flex-end;
+}
+
+.account-pagination-row {
+  display: flex;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.account-pagination-row :deep(.n-pagination) {
+  flex-wrap: wrap;
   justify-content: flex-end;
 }
 
@@ -3374,6 +3517,15 @@ onBeforeUnmount(() => {
   .account-section-actions {
     width: 100%;
     justify-content: flex-start;
+  }
+
+  .account-pagination-row {
+    justify-content: flex-start;
+  }
+
+  .display-control-row {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .sort-control-row {

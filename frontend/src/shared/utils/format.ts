@@ -37,7 +37,14 @@ function parseDisplayDate(value: string): Date | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed
 }
 
-export function formatDateTime(value: string | null): string {
+interface DateTimeFormatOptions {
+  includeSecond?: boolean
+}
+
+export function formatDateTime(
+  value: string | null,
+  options: DateTimeFormatOptions = {},
+): string {
   if (!value) {
     return '-'
   }
@@ -45,14 +52,17 @@ export function formatDateTime(value: string | null): string {
   if (!date) {
     return '-'
   }
-  return new Intl.DateTimeFormat('zh-CN', {
+  const formatOptions: Intl.DateTimeFormatOptions = {
     timeZone: BEIJING_TIME_ZONE,
     month: '2-digit',
     day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
-    second: '2-digit',
-  }).format(date)
+  }
+  if (options.includeSecond !== false) {
+    formatOptions.second = '2-digit'
+  }
+  return new Intl.DateTimeFormat('zh-CN', formatOptions).format(date)
 }
 
 export function formatLocalDateTimeParam(value: number): string {
