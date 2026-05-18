@@ -45,14 +45,15 @@ var defaultKeeperPriorityRules = map[string]int{
 }
 
 type App struct {
-	db           *sql.DB
-	repoRoot     string
-	dataDir      string
-	frontendDist string
-	frontendFS   fs.FS
-	frontendEnv  bool
-	collector    *CollectorRunner
-	keeper       *KeeperRunner
+	db               *sql.DB
+	repoRoot         string
+	dataDir          string
+	frontendDist     string
+	frontendFS       fs.FS
+	frontendEnv      bool
+	collector        *CollectorRunner
+	keeper           *KeeperRunner
+	keeperUsageCache keeperWindowUsageCache
 }
 
 type AppError struct {

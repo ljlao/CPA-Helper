@@ -131,6 +131,25 @@ export interface CodexKeeperStatus {
   logs: string[]
 }
 
+export interface CodexKeeperQuotaWindowUsage {
+  window_start: string
+  window_end: string
+  reset_at: string
+  window_seconds: number
+  records: number
+  success_records: number
+  failed_records: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  reasoning_tokens: number
+  total_tokens: number
+  estimated_cost_usd: number
+  unpriced_records: number
+  stale: boolean
+  window_source: string
+}
+
 export interface CodexKeeperAccount {
   name: string
   email: string | null
@@ -141,6 +160,10 @@ export interface CodexKeeperAccount {
   secondary_used_percent: number | null
   primary_reset_at: string | null
   secondary_reset_at: string | null
+  primary_window_seconds: number | null
+  secondary_window_seconds: number | null
+  primary_window_usage: CodexKeeperQuotaWindowUsage | null
+  secondary_window_usage: CodexKeeperQuotaWindowUsage | null
   quota_threshold: number | null
   last_status_code: number | null
   last_error: string | null

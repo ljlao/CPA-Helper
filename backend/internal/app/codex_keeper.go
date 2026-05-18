@@ -21,11 +21,15 @@ import (
 )
 
 const (
-	keeperUsageURL         = "https://chatgpt.com/backend-api/wham/usage"
-	keeperLogFilePrefix    = "codex-keeper-"
-	keeperLogComponent     = "codex_keeper"
-	keeperLogRetainedFiles = 3
-	keeperMaxInMemoryLogs  = 300
+	keeperUsageURL                 = "https://chatgpt.com/backend-api/wham/usage"
+	keeperLogFilePrefix            = "codex-keeper-"
+	keeperLogComponent             = "codex_keeper"
+	keeperLogRetainedFiles         = 3
+	keeperMaxInMemoryLogs          = 300
+	keeperQuotaWindowUsageCacheTTL = 30 * time.Second
+	keeperQuotaWindowStartGrace    = 60 * time.Second
+	keeperFiveHourWindowSeconds    = 5 * 60 * 60
+	keeperWeekWindowSeconds        = 7 * 24 * 60 * 60
 )
 
 type KeeperRunner struct {
@@ -105,39 +109,96 @@ type keeperPriorityUpdateRequest struct {
 }
 
 type keeperAccount struct {
-	Name                 string     `json:"name"`
-	Email                *string    `json:"email"`
-	AccountType          *string    `json:"account_type"`
-	Disabled             bool       `json:"disabled"`
-	Priority             *int       `json:"priority"`
-	PrimaryUsedPercent   *int       `json:"primary_used_percent"`
-	SecondaryUsedPercent *int       `json:"secondary_used_percent"`
-	PrimaryResetAt       *time.Time `json:"primary_reset_at"`
-	SecondaryResetAt     *time.Time `json:"secondary_reset_at"`
-	QuotaThreshold       *int       `json:"quota_threshold"`
-	LastStatusCode       *int       `json:"last_status_code"`
-	LastError            *string    `json:"last_error"`
-	LatestAction         *string    `json:"latest_action"`
-	LastCheckedAt        *time.Time `json:"last_checked_at"`
-	LastHealthyAt        *time.Time `json:"last_healthy_at"`
+	Name                   string     `json:"name"`
+	Email                  *string    `json:"email"`
+	AccountType            *string    `json:"account_type"`
+	Disabled               bool       `json:"disabled"`
+	Priority               *int       `json:"priority"`
+	PrimaryUsedPercent     *int       `json:"primary_used_percent"`
+	SecondaryUsedPercent   *int       `json:"secondary_used_percent"`
+	PrimaryResetAt         *time.Time `json:"primary_reset_at"`
+	SecondaryResetAt       *time.Time `json:"secondary_reset_at"`
+	PrimaryWindowSeconds   *int       `json:"primary_window_seconds"`
+	SecondaryWindowSeconds *int       `json:"secondary_window_seconds"`
+	QuotaThreshold         *int       `json:"quota_threshold"`
+	LastStatusCode         *int       `json:"last_status_code"`
+	LastError              *string    `json:"last_error"`
+	LatestAction           *string    `json:"latest_action"`
+	LastCheckedAt          *time.Time `json:"last_checked_at"`
+	LastHealthyAt          *time.Time `json:"last_healthy_at"`
 }
 
 type keeperAccountResponse struct {
-	Name                 string  `json:"name"`
-	Email                *string `json:"email"`
-	AccountType          *string `json:"account_type"`
-	Disabled             bool    `json:"disabled"`
-	Priority             *int    `json:"priority"`
-	PrimaryUsedPercent   *int    `json:"primary_used_percent"`
-	SecondaryUsedPercent *int    `json:"secondary_used_percent"`
-	PrimaryResetAt       *string `json:"primary_reset_at"`
-	SecondaryResetAt     *string `json:"secondary_reset_at"`
-	QuotaThreshold       *int    `json:"quota_threshold"`
-	LastStatusCode       *int    `json:"last_status_code"`
-	LastError            *string `json:"last_error"`
-	LatestAction         *string `json:"latest_action"`
-	LastCheckedAt        *string `json:"last_checked_at"`
-	LastHealthyAt        *string `json:"last_healthy_at"`
+	Name                   string                          `json:"name"`
+	Email                  *string                         `json:"email"`
+	AccountType            *string                         `json:"account_type"`
+	Disabled               bool                            `json:"disabled"`
+	Priority               *int                            `json:"priority"`
+	PrimaryUsedPercent     *int                            `json:"primary_used_percent"`
+	SecondaryUsedPercent   *int                            `json:"secondary_used_percent"`
+	PrimaryResetAt         *string                         `json:"primary_reset_at"`
+	SecondaryResetAt       *string                         `json:"secondary_reset_at"`
+	PrimaryWindowSeconds   *int                            `json:"primary_window_seconds"`
+	SecondaryWindowSeconds *int                            `json:"secondary_window_seconds"`
+	PrimaryWindowUsage     *keeperQuotaWindowUsageResponse `json:"primary_window_usage"`
+	SecondaryWindowUsage   *keeperQuotaWindowUsageResponse `json:"secondary_window_usage"`
+	QuotaThreshold         *int                            `json:"quota_threshold"`
+	LastStatusCode         *int                            `json:"last_status_code"`
+	LastError              *string                         `json:"last_error"`
+	LatestAction           *string                         `json:"latest_action"`
+	LastCheckedAt          *string                         `json:"last_checked_at"`
+	LastHealthyAt          *string                         `json:"last_healthy_at"`
+}
+
+type keeperQuotaWindowUsageResponse struct {
+	WindowStart      string  `json:"window_start"`
+	WindowEnd        string  `json:"window_end"`
+	ResetAt          string  `json:"reset_at"`
+	WindowSeconds    int     `json:"window_seconds"`
+	Records          int     `json:"records"`
+	SuccessRecords   int     `json:"success_records"`
+	FailedRecords    int     `json:"failed_records"`
+	InputTokens      int     `json:"input_tokens"`
+	OutputTokens     int     `json:"output_tokens"`
+	CachedTokens     int     `json:"cached_tokens"`
+	ReasoningTokens  int     `json:"reasoning_tokens"`
+	TotalTokens      int     `json:"total_tokens"`
+	EstimatedCostUSD float64 `json:"estimated_cost_usd"`
+	UnpricedRecords  int     `json:"unpriced_records"`
+	Stale            bool    `json:"stale"`
+	WindowSource     string  `json:"window_source"`
+}
+
+type keeperQuotaWindowUsage struct {
+	WindowStart      time.Time
+	WindowEnd        time.Time
+	ResetAt          time.Time
+	WindowSeconds    int
+	StartGrace       time.Duration
+	Records          int
+	SuccessRecords   int
+	FailedRecords    int
+	InputTokens      int
+	OutputTokens     int
+	CachedTokens     int
+	ReasoningTokens  int
+	TotalTokens      int
+	EstimatedCostUSD float64
+	UnpricedRecords  int
+	Stale            bool
+	WindowSource     string
+}
+
+type keeperQuotaWindowUsagePair struct {
+	Primary   *keeperQuotaWindowUsage
+	Secondary *keeperQuotaWindowUsage
+}
+
+type keeperWindowUsageCache struct {
+	mu        sync.Mutex
+	key       string
+	expiresAt time.Time
+	usages    map[string]keeperQuotaWindowUsagePair
 }
 
 type keeperAuthState struct {
@@ -148,11 +209,13 @@ type keeperAuthState struct {
 }
 
 type keeperUsageInfo struct {
-	PlanType             string
-	PrimaryUsedPercent   int
-	SecondaryUsedPercent *int
-	PrimaryResetAt       *time.Time
-	SecondaryResetAt     *time.Time
+	PlanType               string
+	PrimaryUsedPercent     int
+	SecondaryUsedPercent   *int
+	PrimaryResetAt         *time.Time
+	SecondaryResetAt       *time.Time
+	PrimaryWindowSeconds   *int
+	SecondaryWindowSeconds *int
 }
 
 type keeperHTTPResult struct {
@@ -163,23 +226,25 @@ type keeperHTTPResult struct {
 }
 
 type keeperAccountResult struct {
-	Name                 string
-	Result               string
-	Email                *string
-	AccountType          *string
-	Priority             *int
-	RestorePriority      *int
-	ClearRestorePriority bool
-	Disabled             *bool
-	PrimaryUsedPercent   *int
-	SecondaryUsedPercent *int
-	PrimaryResetAt       *time.Time
-	SecondaryResetAt     *time.Time
-	QuotaThreshold       *int
-	LastStatusCode       *int
-	LastError            *string
-	LatestAction         *string
-	CheckedAt            time.Time
+	Name                   string
+	Result                 string
+	Email                  *string
+	AccountType            *string
+	Priority               *int
+	RestorePriority        *int
+	ClearRestorePriority   bool
+	Disabled               *bool
+	PrimaryUsedPercent     *int
+	SecondaryUsedPercent   *int
+	PrimaryResetAt         *time.Time
+	SecondaryResetAt       *time.Time
+	PrimaryWindowSeconds   *int
+	SecondaryWindowSeconds *int
+	QuotaThreshold         *int
+	LastStatusCode         *int
+	LastError              *string
+	LatestAction           *string
+	CheckedAt              time.Time
 }
 
 func NewKeeperRunner(app *App) *KeeperRunner {
@@ -831,7 +896,11 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 		if err != nil {
 			return err
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": keeperAccountResponses(accounts)})
+		windowUsages, err := a.keeperQuotaWindowUsages(r.Context(), accounts)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": keeperAccountResponses(accounts, windowUsages)})
 		return nil
 	case len(parts) == 1 && parts[0] == "run-once":
 		if err := requireMethod(r, http.MethodPost); err != nil {
@@ -957,28 +1026,393 @@ func keeperSettingsResponse(cfg AppConfig) map[string]any {
 	}
 }
 
-func keeperAccountResponses(accounts []keeperAccount) []keeperAccountResponse {
+func keeperAccountResponses(accounts []keeperAccount, windowUsages map[string]keeperQuotaWindowUsagePair) []keeperAccountResponse {
 	responses := make([]keeperAccountResponse, 0, len(accounts))
 	for _, account := range accounts {
+		usage := windowUsages[account.Name]
 		responses = append(responses, keeperAccountResponse{
-			Name:                 account.Name,
-			Email:                account.Email,
-			AccountType:          account.AccountType,
-			Disabled:             account.Disabled,
-			Priority:             keeperDisplayPriority(account.Priority),
-			PrimaryUsedPercent:   account.PrimaryUsedPercent,
-			SecondaryUsedPercent: account.SecondaryUsedPercent,
-			PrimaryResetAt:       apiDateTimePtr(account.PrimaryResetAt),
-			SecondaryResetAt:     apiDateTimePtr(account.SecondaryResetAt),
-			QuotaThreshold:       account.QuotaThreshold,
-			LastStatusCode:       account.LastStatusCode,
-			LastError:            account.LastError,
-			LatestAction:         account.LatestAction,
-			LastCheckedAt:        apiDateTimePtr(account.LastCheckedAt),
-			LastHealthyAt:        apiDateTimePtr(account.LastHealthyAt),
+			Name:                   account.Name,
+			Email:                  account.Email,
+			AccountType:            account.AccountType,
+			Disabled:               account.Disabled,
+			Priority:               keeperDisplayPriority(account.Priority),
+			PrimaryUsedPercent:     account.PrimaryUsedPercent,
+			SecondaryUsedPercent:   account.SecondaryUsedPercent,
+			PrimaryResetAt:         apiDateTimePtr(account.PrimaryResetAt),
+			SecondaryResetAt:       apiDateTimePtr(account.SecondaryResetAt),
+			PrimaryWindowSeconds:   account.PrimaryWindowSeconds,
+			SecondaryWindowSeconds: account.SecondaryWindowSeconds,
+			PrimaryWindowUsage:     keeperQuotaWindowUsageResponseFrom(usage.Primary),
+			SecondaryWindowUsage:   keeperQuotaWindowUsageResponseFrom(usage.Secondary),
+			QuotaThreshold:         account.QuotaThreshold,
+			LastStatusCode:         account.LastStatusCode,
+			LastError:              account.LastError,
+			LatestAction:           account.LatestAction,
+			LastCheckedAt:          apiDateTimePtr(account.LastCheckedAt),
+			LastHealthyAt:          apiDateTimePtr(account.LastHealthyAt),
 		})
 	}
 	return responses
+}
+
+func keeperQuotaWindowUsageResponseFrom(usage *keeperQuotaWindowUsage) *keeperQuotaWindowUsageResponse {
+	if usage == nil {
+		return nil
+	}
+	return &keeperQuotaWindowUsageResponse{
+		WindowStart:      apiDateTime(usage.WindowStart),
+		WindowEnd:        apiDateTime(usage.WindowEnd),
+		ResetAt:          apiDateTime(usage.ResetAt),
+		WindowSeconds:    usage.WindowSeconds,
+		Records:          usage.Records,
+		SuccessRecords:   usage.SuccessRecords,
+		FailedRecords:    usage.FailedRecords,
+		InputTokens:      usage.InputTokens,
+		OutputTokens:     usage.OutputTokens,
+		CachedTokens:     usage.CachedTokens,
+		ReasoningTokens:  usage.ReasoningTokens,
+		TotalTokens:      usage.TotalTokens,
+		EstimatedCostUSD: usage.EstimatedCostUSD,
+		UnpricedRecords:  usage.UnpricedRecords,
+		Stale:            usage.Stale,
+		WindowSource:     usage.WindowSource,
+	}
+}
+
+func (a *App) keeperQuotaWindowUsages(ctx context.Context, accounts []keeperAccount) (map[string]keeperQuotaWindowUsagePair, error) {
+	if len(accounts) == 0 {
+		return map[string]keeperQuotaWindowUsagePair{}, nil
+	}
+	key, err := a.keeperQuotaWindowUsageCacheKey(ctx)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().In(appTimeLocation)
+	if cached, ok := a.cachedKeeperQuotaWindowUsages(key, now); ok {
+		return cached, nil
+	}
+	usages, err := a.computeKeeperQuotaWindowUsages(ctx, accounts, now)
+	if err != nil {
+		return nil, err
+	}
+	a.storeKeeperQuotaWindowUsages(key, now.Add(keeperQuotaWindowUsageCacheTTL), usages)
+	return usages, nil
+}
+
+func (a *App) keeperQuotaWindowUsageCacheKey(ctx context.Context) (string, error) {
+	var stateUpdated, usageID sql.NullString
+	if err := a.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(CAST(updated_at AS TEXT)), '') FROM codex_keeper_auth_states`).Scan(&stateUpdated); err != nil {
+		return "", err
+	}
+	if err := a.db.QueryRowContext(ctx, `SELECT COALESCE(CAST(MAX(id) AS TEXT), '') FROM usage_records`).Scan(&usageID); err != nil {
+		return "", err
+	}
+	return stateUpdated.String + "|" + usageID.String, nil
+}
+
+func (a *App) cachedKeeperQuotaWindowUsages(key string, now time.Time) (map[string]keeperQuotaWindowUsagePair, bool) {
+	a.keeperUsageCache.mu.Lock()
+	defer a.keeperUsageCache.mu.Unlock()
+	if key == "" || key != a.keeperUsageCache.key || !now.Before(a.keeperUsageCache.expiresAt) {
+		return nil, false
+	}
+	return copyKeeperQuotaWindowUsagePairs(a.keeperUsageCache.usages), true
+}
+
+func (a *App) storeKeeperQuotaWindowUsages(key string, expiresAt time.Time, usages map[string]keeperQuotaWindowUsagePair) {
+	a.keeperUsageCache.mu.Lock()
+	defer a.keeperUsageCache.mu.Unlock()
+	a.keeperUsageCache.key = key
+	a.keeperUsageCache.expiresAt = expiresAt
+	a.keeperUsageCache.usages = copyKeeperQuotaWindowUsagePairs(usages)
+}
+
+func copyKeeperQuotaWindowUsagePairs(source map[string]keeperQuotaWindowUsagePair) map[string]keeperQuotaWindowUsagePair {
+	if source == nil {
+		return map[string]keeperQuotaWindowUsagePair{}
+	}
+	copied := make(map[string]keeperQuotaWindowUsagePair, len(source))
+	for name, pair := range source {
+		copied[name] = keeperQuotaWindowUsagePair{
+			Primary:   copyKeeperQuotaWindowUsage(pair.Primary),
+			Secondary: copyKeeperQuotaWindowUsage(pair.Secondary),
+		}
+	}
+	return copied
+}
+
+func copyKeeperQuotaWindowUsage(source *keeperQuotaWindowUsage) *keeperQuotaWindowUsage {
+	if source == nil {
+		return nil
+	}
+	copied := *source
+	return &copied
+}
+
+func (a *App) computeKeeperQuotaWindowUsages(ctx context.Context, accounts []keeperAccount, now time.Time) (map[string]keeperQuotaWindowUsagePair, error) {
+	usages := map[string]keeperQuotaWindowUsagePair{}
+	sourceAccounts := map[string]string{}
+	aliases := map[string][]string{}
+	var minStart, maxEnd time.Time
+
+	for _, account := range accounts {
+		addKeeperAuthAlias(aliases, account.Name, account.Name)
+		addKeeperSourceAccountAlias(sourceAccounts, account.Name, account.Name)
+		if account.Email != nil {
+			addKeeperAuthAlias(aliases, *account.Email, account.Name)
+			addKeeperSourceAccountAlias(sourceAccounts, *account.Email, account.Name)
+		}
+		if account.Disabled {
+			continue
+		}
+
+		pair := keeperQuotaWindowPairForAccount(account, now)
+		if pair.Primary == nil && pair.Secondary == nil {
+			continue
+		}
+		usages[account.Name] = pair
+		minStart, maxEnd = keeperQuotaWindowBounds(minStart, maxEnd, pair.Primary)
+		minStart, maxEnd = keeperQuotaWindowBounds(minStart, maxEnd, pair.Secondary)
+	}
+	if minStart.IsZero() || maxEnd.IsZero() {
+		return usages, nil
+	}
+
+	queryStart := minStart
+	maxLookbackStart := now.Add(-time.Duration(keeperWeekWindowSeconds)*time.Second - keeperQuotaWindowStartGrace)
+	if queryStart.Before(maxLookbackStart) {
+		queryStart = maxLookbackStart
+	}
+	records, err := a.keeperUsageRecordsInRange(ctx, queryStart, maxEnd)
+	if err != nil {
+		return nil, err
+	}
+	prices, err := a.priceMap(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, record := range records {
+		accountName, ok := keeperAccountNameForUsageRecord(record, sourceAccounts, aliases)
+		if !ok {
+			continue
+		}
+		pair, ok := usages[accountName]
+		if !ok {
+			continue
+		}
+		if keeperRecordInQuotaWindow(record, pair.Primary) {
+			addRecordToKeeperQuotaWindowUsage(pair.Primary, record, prices)
+		}
+		if keeperRecordInQuotaWindow(record, pair.Secondary) {
+			addRecordToKeeperQuotaWindowUsage(pair.Secondary, record, prices)
+		}
+	}
+	return usages, nil
+}
+
+func keeperQuotaWindowPairForAccount(account keeperAccount, now time.Time) keeperQuotaWindowUsagePair {
+	return keeperQuotaWindowUsagePair{
+		Primary:   keeperQuotaWindowForAccount(account, true, now),
+		Secondary: keeperQuotaWindowForAccount(account, false, now),
+	}
+}
+
+func keeperQuotaWindowForAccount(account keeperAccount, primary bool, now time.Time) *keeperQuotaWindowUsage {
+	if !primary && keeperFreeQuotaWindowAccount(account.AccountType) {
+		return nil
+	}
+	resetAt := account.PrimaryResetAt
+	windowSeconds := account.PrimaryWindowSeconds
+	usedPercent := account.PrimaryUsedPercent
+	if !primary {
+		resetAt = account.SecondaryResetAt
+		windowSeconds = account.SecondaryWindowSeconds
+		usedPercent = account.SecondaryUsedPercent
+	}
+	if resetAt == nil {
+		return nil
+	}
+	seconds, source, ok := keeperQuotaWindowSeconds(account.AccountType, windowSeconds, primary)
+	if !ok {
+		return nil
+	}
+	windowEnd := resetAt.In(appTimeLocation)
+	windowStart := windowEnd.Add(-time.Duration(seconds) * time.Second)
+	return &keeperQuotaWindowUsage{
+		WindowStart:   windowStart,
+		WindowEnd:     windowEnd,
+		ResetAt:       windowEnd,
+		WindowSeconds: seconds,
+		StartGrace:    keeperQuotaWindowStartGraceForUsage(usedPercent),
+		Stale:         !now.Before(windowEnd),
+		WindowSource:  source,
+	}
+}
+
+func keeperQuotaWindowStartGraceForUsage(usedPercent *int) time.Duration {
+	if usedPercent != nil && *usedPercent >= 100 {
+		return keeperQuotaWindowStartGrace
+	}
+	return 0
+}
+
+func keeperQuotaWindowSeconds(accountType *string, saved *int, primary bool) (int, string, bool) {
+	if saved != nil && *saved > 0 {
+		return *saved, "codex", true
+	}
+	if keeperFreeQuotaWindowAccount(accountType) {
+		return keeperWeekWindowSeconds, "inferred", true
+	}
+	if keeperPaidQuotaWindowAccount(accountType) {
+		if primary {
+			return keeperFiveHourWindowSeconds, "inferred", true
+		}
+		return keeperWeekWindowSeconds, "inferred", true
+	}
+	return 0, "", false
+}
+
+func keeperFreeQuotaWindowAccount(accountType *string) bool {
+	return strings.ToLower(strings.TrimSpace(valueOr(accountType, ""))) == "free"
+}
+
+func keeperPaidQuotaWindowAccount(accountType *string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(valueOr(accountType, "")))
+	return normalized == "plus" || normalized == "team" || strings.HasPrefix(normalized, "pro")
+}
+
+func keeperQuotaWindowBounds(minStart, maxEnd time.Time, usage *keeperQuotaWindowUsage) (time.Time, time.Time) {
+	if usage == nil {
+		return minStart, maxEnd
+	}
+	windowStart := usage.WindowStart.Add(-usage.StartGrace)
+	if minStart.IsZero() || windowStart.Before(minStart) {
+		minStart = windowStart
+	}
+	if maxEnd.IsZero() || usage.WindowEnd.After(maxEnd) {
+		maxEnd = usage.WindowEnd
+	}
+	return minStart, maxEnd
+}
+
+func (a *App) keeperUsageRecordsInRange(ctx context.Context, start, end time.Time) ([]UsageRecord, error) {
+	rows, err := a.db.QueryContext(ctx, `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, endpoint, source,
+		source_account, request_id, auth, auth_index, latency_ms, failed, input_tokens, output_tokens, cached_tokens,
+		reasoning_tokens, total_tokens, dedupe_key, raw_json
+		FROM usage_records
+		WHERE timestamp >= ? AND timestamp < ?
+		ORDER BY timestamp`, dbTime(start), dbTime(end))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanUsageRecords(rows)
+}
+
+func addKeeperSourceAccountAlias(aliases map[string]string, value string, name string) {
+	valuePtr := &value
+	sourceAccount := sourceAccountFromUsageSource(valuePtr)
+	if sourceAccount == nil {
+		return
+	}
+	normalizedName := strings.TrimSpace(name)
+	if normalizedName == "" {
+		return
+	}
+	existing, ok := aliases[*sourceAccount]
+	if ok && existing != normalizedName {
+		aliases[*sourceAccount] = ""
+		return
+	}
+	aliases[*sourceAccount] = normalizedName
+}
+
+func keeperAccountNameForUsageRecord(record UsageRecord, sourceAccounts map[string]string, aliases map[string][]string) (string, bool) {
+	if sourceAccount := keeperUsageRecordSourceAccount(record); sourceAccount != "" {
+		if name, ok := sourceAccounts[sourceAccount]; ok && name != "" {
+			return name, true
+		}
+		return "", false
+	}
+
+	identifiers := []string{}
+	seen := map[string]bool{}
+	addIdentifier := func(value *string) {
+		if value == nil {
+			return
+		}
+		normalized := strings.TrimSpace(*value)
+		key := keeperAuthAliasKey(normalized)
+		if key == "" || seen[key] {
+			return
+		}
+		seen[key] = true
+		identifiers = append(identifiers, normalized)
+	}
+	addIdentifier(record.AuthIndex)
+	addIdentifier(record.Source)
+	for _, field := range []string{"auth_index", "authIndex", "index", "auth_name", "authName", "account_id", "accountId", "email", "account_email", "accountEmail", "user_email", "userEmail"} {
+		addIdentifier(rawJSONStringField(record.RawJSON, field))
+	}
+	for _, identifier := range identifiers {
+		if name, ok := keeperSingleAuthNameForUsageIdentifier(identifier, aliases); ok {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+func keeperUsageRecordSourceAccount(record UsageRecord) string {
+	if record.SourceAccount != nil {
+		return strings.ToLower(strings.TrimSpace(*record.SourceAccount))
+	}
+	if sourceAccount := sourceAccountFromUsageSource(record.Source); sourceAccount != nil {
+		return *sourceAccount
+	}
+	return ""
+}
+
+func keeperSingleAuthNameForUsageIdentifier(identifier string, aliases map[string][]string) (string, bool) {
+	names := keeperAuthNamesForUsageIdentifier(identifier, aliases)
+	if len(names) != 1 {
+		return "", false
+	}
+	normalized := strings.TrimSpace(names[0])
+	if normalized == "" {
+		return "", false
+	}
+	return normalized, true
+}
+
+func keeperRecordInQuotaWindow(record UsageRecord, usage *keeperQuotaWindowUsage) bool {
+	if usage == nil {
+		return false
+	}
+	start := usage.WindowStart.Add(-usage.StartGrace)
+	return !record.Timestamp.Before(start) && record.Timestamp.Before(usage.WindowEnd)
+}
+
+func addRecordToKeeperQuotaWindowUsage(usage *keeperQuotaWindowUsage, record UsageRecord, prices map[[2]string]ModelPrice) {
+	if usage == nil {
+		return
+	}
+	usage.Records++
+	if record.Failed {
+		usage.FailedRecords++
+	} else {
+		usage.SuccessRecords++
+	}
+	usage.InputTokens += record.InputTokens
+	usage.OutputTokens += record.OutputTokens
+	usage.CachedTokens += record.CachedTokens
+	usage.ReasoningTokens += record.ReasoningTokens
+	usage.TotalTokens += record.TotalTokens
+	amount, unpriced := recordCost(record, prices)
+	if unpriced {
+		usage.UnpricedRecords++
+		return
+	}
+	usage.EstimatedCostUSD = mathRound(usage.EstimatedCostUSD+amount, 8)
 }
 
 func (a *App) updateKeeperSettings(w http.ResponseWriter, r *http.Request) error {
@@ -1729,6 +2163,8 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	result.SecondaryUsedPercent = usage.SecondaryUsedPercent
 	result.PrimaryResetAt = usage.PrimaryResetAt
 	result.SecondaryResetAt = usage.SecondaryResetAt
+	result.PrimaryWindowSeconds = usage.PrimaryWindowSeconds
+	result.SecondaryWindowSeconds = usage.SecondaryWindowSeconds
 	result.QuotaThreshold = &cfg.CodexKeeper.QuotaThreshold
 	result.Result = "healthy"
 
@@ -1992,7 +2428,7 @@ func (a *App) listKeeperAccounts(ctx context.Context) ([]keeperAccount, error) {
 		SELECT auth_name, email, account_type, disabled, priority, primary_used_percent,
 		       secondary_used_percent, CAST(primary_reset_at AS TEXT), CAST(secondary_reset_at AS TEXT), quota_threshold,
 		       last_status_code, last_error, latest_action, CAST(last_checked_at AS TEXT), CAST(last_healthy_at AS TEXT),
-		       restore_priority, CAST(created_at AS TEXT), CAST(updated_at AS TEXT)
+		       primary_window_seconds, secondary_window_seconds, restore_priority, CAST(created_at AS TEXT), CAST(updated_at AS TEXT)
 		FROM codex_keeper_auth_states
 		ORDER BY COALESCE(email, ''), auth_name
 	`)
@@ -2066,7 +2502,7 @@ func (a *App) getKeeperState(ctx context.Context, name string) (*keeperAuthState
 		SELECT auth_name, email, account_type, disabled, priority, primary_used_percent,
 		       secondary_used_percent, CAST(primary_reset_at AS TEXT), CAST(secondary_reset_at AS TEXT), quota_threshold,
 		       last_status_code, last_error, latest_action, CAST(last_checked_at AS TEXT), CAST(last_healthy_at AS TEXT),
-		       restore_priority, CAST(created_at AS TEXT), CAST(updated_at AS TEXT)
+		       primary_window_seconds, secondary_window_seconds, restore_priority, CAST(created_at AS TEXT), CAST(updated_at AS TEXT)
 		FROM codex_keeper_auth_states WHERE auth_name = ?
 	`, name)
 	if err != nil {
@@ -2086,11 +2522,11 @@ func (a *App) getKeeperState(ctx context.Context, name string) (*keeperAuthState
 func scanKeeperState(scanner interface{ Scan(dest ...any) error }) (keeperAuthState, error) {
 	var state keeperAuthState
 	var email, accountType, primaryReset, secondaryReset, lastError, latestAction, lastChecked, lastHealthy, createdAt, updatedAt sql.NullString
-	var priority, primaryUsed, secondaryUsed, quotaThreshold, lastStatus, restorePriority sql.NullInt64
+	var priority, primaryUsed, secondaryUsed, quotaThreshold, lastStatus, primaryWindowSeconds, secondaryWindowSeconds, restorePriority sql.NullInt64
 	err := scanner.Scan(
 		&state.Name, &email, &accountType, &state.Disabled, &priority, &primaryUsed,
 		&secondaryUsed, &primaryReset, &secondaryReset, &quotaThreshold, &lastStatus,
-		&lastError, &latestAction, &lastChecked, &lastHealthy, &restorePriority,
+		&lastError, &latestAction, &lastChecked, &lastHealthy, &primaryWindowSeconds, &secondaryWindowSeconds, &restorePriority,
 		&createdAt, &updatedAt,
 	)
 	if err != nil {
@@ -2103,6 +2539,8 @@ func scanKeeperState(scanner interface{ Scan(dest ...any) error }) (keeperAuthSt
 	state.SecondaryUsedPercent = nullableInt(secondaryUsed)
 	state.PrimaryResetAt = timePtr(primaryReset)
 	state.SecondaryResetAt = timePtr(secondaryReset)
+	state.PrimaryWindowSeconds = nullableInt(primaryWindowSeconds)
+	state.SecondaryWindowSeconds = nullableInt(secondaryWindowSeconds)
 	state.QuotaThreshold = nullableInt(quotaThreshold)
 	state.LastStatusCode = nullableInt(lastStatus)
 	state.LastError = nullableString(lastError)
@@ -2130,8 +2568,9 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 		INSERT INTO codex_keeper_auth_states (
 			auth_name, email, account_type, disabled, priority, restore_priority, latest_action, last_error,
 			last_status_code, primary_used_percent, secondary_used_percent, quota_threshold,
-			primary_reset_at, secondary_reset_at, last_checked_at, last_healthy_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			primary_reset_at, secondary_reset_at, primary_window_seconds, secondary_window_seconds,
+			last_checked_at, last_healthy_at, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(auth_name) DO UPDATE SET
 			email = excluded.email,
 			account_type = excluded.account_type,
@@ -2150,10 +2589,12 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			quota_threshold = excluded.quota_threshold,
 			primary_reset_at = excluded.primary_reset_at,
 			secondary_reset_at = excluded.secondary_reset_at,
+			primary_window_seconds = excluded.primary_window_seconds,
+			secondary_window_seconds = excluded.secondary_window_seconds,
 			last_checked_at = excluded.last_checked_at,
 			last_healthy_at = COALESCE(excluded.last_healthy_at, codex_keeper_auth_states.last_healthy_at),
 			updated_at = excluded.updated_at
-	`, result.Name, result.Email, result.AccountType, boolValue(result.Disabled), result.Priority, result.RestorePriority, result.LatestAction, result.LastError, result.LastStatusCode, result.PrimaryUsedPercent, result.SecondaryUsedPercent, result.QuotaThreshold, dbTimePtr(result.PrimaryResetAt), dbTimePtr(result.SecondaryResetAt), checkedAt, lastHealthy, now, now, result.ClearRestorePriority)
+	`, result.Name, result.Email, result.AccountType, boolValue(result.Disabled), result.Priority, result.RestorePriority, result.LatestAction, result.LastError, result.LastStatusCode, result.PrimaryUsedPercent, result.SecondaryUsedPercent, result.QuotaThreshold, dbTimePtr(result.PrimaryResetAt), dbTimePtr(result.SecondaryResetAt), result.PrimaryWindowSeconds, result.SecondaryWindowSeconds, checkedAt, lastHealthy, now, now, result.ClearRestorePriority)
 	return err
 }
 
@@ -2387,7 +2828,27 @@ func parseKeeperUsageInfo(payload map[string]any) keeperUsageInfo {
 	usage.SecondaryUsedPercent = keeperIntPtr(secondary["used_percent"])
 	usage.PrimaryResetAt = quotaResetAt(primary, time.Now().In(appTimeLocation))
 	usage.SecondaryResetAt = quotaResetAt(secondary, time.Now().In(appTimeLocation))
+	usage.PrimaryWindowSeconds = quotaWindowSeconds(primary)
+	usage.SecondaryWindowSeconds = quotaWindowSeconds(secondary)
 	return usage
+}
+
+func quotaWindowSeconds(window map[string]any) *int {
+	if window == nil {
+		return nil
+	}
+	value := keeperIntPtr(
+		window["limit_window_seconds"],
+		window["limitWindowSeconds"],
+		window["window_seconds"],
+		window["windowSeconds"],
+		window["rolling_window_seconds"],
+		window["rollingWindowSeconds"],
+	)
+	if value == nil || *value <= 0 {
+		return nil
+	}
+	return value
 }
 
 func quotaResetAt(window map[string]any, base time.Time) *time.Time {

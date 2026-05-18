@@ -3,8 +3,10 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -100,6 +102,258 @@ func TestConditionalKeeperRefreshCandidatesUseUsageQuotaAndCache(t *testing.T) {
 		"remote-short-index.json",
 		"quota-due.json",
 	})
+}
+
+func TestKeeperQuotaWindowUsageAttributionPrefersSourceAccount(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	now := time.Date(2026, 5, 18, 12, 30, 0, 0, appTimeLocation)
+	resetAt := now.Add(30 * time.Minute)
+	windowSeconds := 3600
+	accounts := []keeperAccount{
+		{
+			Name:                 "source.json",
+			Email:                stringPtr("source@example.com"),
+			AccountType:          stringPtr("plus"),
+			PrimaryResetAt:       timePtrValue(resetAt),
+			PrimaryWindowSeconds: intPtrValue(windowSeconds),
+		},
+		{
+			Name:                 "auth.json",
+			Email:                stringPtr("auth@example.com"),
+			AccountType:          stringPtr("plus"),
+			PrimaryResetAt:       timePtrValue(resetAt),
+			PrimaryWindowSeconds: intPtrValue(windowSeconds),
+		},
+	}
+	insertKeeperWindowUsageRecord(t, app, keeperWindowUsageSeed{
+		Dedupe:       "source-wins",
+		Timestamp:    now.Add(-10 * time.Minute),
+		Source:       "source@example.com",
+		AuthIndex:    "auth.json",
+		InputTokens:  11,
+		OutputTokens: 7,
+		RawJSON:      `{"source":"source@example.com","auth_index":"auth.json"}`,
+	})
+	insertKeeperWindowUsageRecord(t, app, keeperWindowUsageSeed{
+		Dedupe:       "auth-fallback",
+		Timestamp:    now.Add(-5 * time.Minute),
+		Source:       "queue",
+		AuthIndex:    "auth.json",
+		InputTokens:  13,
+		OutputTokens: 9,
+		RawJSON:      `{"auth_index":"auth.json"}`,
+	})
+	insertKeeperWindowUsageRecord(t, app, keeperWindowUsageSeed{
+		Dedupe:       "unknown",
+		Timestamp:    now.Add(-4 * time.Minute),
+		Source:       "unknown@example.com",
+		AuthIndex:    "auth.json",
+		InputTokens:  17,
+		OutputTokens: 3,
+		RawJSON:      `{"source":"unknown@example.com","auth_index":"auth.json"}`,
+	})
+
+	usages, err := app.computeKeeperQuotaWindowUsages(context.Background(), accounts, now)
+	if err != nil {
+		t.Fatalf("compute window usages: %v", err)
+	}
+	if got := usages["source.json"].Primary.Records; got != 1 {
+		t.Fatalf("source account records = %d, want 1", got)
+	}
+	if got := usages["source.json"].Primary.TotalTokens; got != 18 {
+		t.Fatalf("source account tokens = %d, want 18", got)
+	}
+	if got := usages["auth.json"].Primary.Records; got != 1 {
+		t.Fatalf("auth fallback records = %d, want 1", got)
+	}
+}
+
+func TestKeeperQuotaWindowUsageInfersAccountWindows(t *testing.T) {
+	now := time.Date(2026, 5, 18, 12, 30, 0, 0, appTimeLocation)
+	resetAt := now.Add(30 * time.Minute)
+
+	freePair := keeperQuotaWindowPairForAccount(keeperAccount{
+		Name:           "free.json",
+		AccountType:    stringPtr("free"),
+		PrimaryResetAt: timePtrValue(resetAt),
+	}, now)
+	if freePair.Primary == nil {
+		t.Fatal("free primary window is nil, want weekly window")
+	}
+	if freePair.Primary.WindowSeconds != keeperWeekWindowSeconds || freePair.Primary.WindowSource != "inferred" {
+		t.Fatalf("free window = %d/%s, want inferred weekly", freePair.Primary.WindowSeconds, freePair.Primary.WindowSource)
+	}
+	if freePair.Secondary != nil {
+		t.Fatal("free secondary window is not nil, want single weekly window")
+	}
+
+	plusPair := keeperQuotaWindowPairForAccount(keeperAccount{
+		Name:             "plus.json",
+		AccountType:      stringPtr("plus"),
+		PrimaryResetAt:   timePtrValue(resetAt),
+		SecondaryResetAt: timePtrValue(resetAt.Add(2 * time.Hour)),
+	}, now)
+	if plusPair.Primary == nil || plusPair.Primary.WindowSeconds != keeperFiveHourWindowSeconds {
+		t.Fatalf("plus primary window = %#v, want inferred 5h", plusPair.Primary)
+	}
+	if plusPair.Secondary == nil || plusPair.Secondary.WindowSeconds != keeperWeekWindowSeconds {
+		t.Fatalf("plus secondary window = %#v, want inferred weekly", plusPair.Secondary)
+	}
+
+	usage := parseKeeperUsageInfo(map[string]any{
+		"plan_type": "plus",
+		"rate_limit": map[string]any{
+			"primary_window": map[string]any{
+				"used_percent":         20,
+				"limit_window_seconds": float64(1234),
+			},
+			"secondary_window": map[string]any{
+				"used_percent":         40,
+				"limit_window_seconds": float64(5678),
+			},
+		},
+	})
+	if usage.PrimaryWindowSeconds == nil || *usage.PrimaryWindowSeconds != 1234 {
+		t.Fatalf("primary limit_window_seconds = %v, want 1234", usage.PrimaryWindowSeconds)
+	}
+	if usage.SecondaryWindowSeconds == nil || *usage.SecondaryWindowSeconds != 5678 {
+		t.Fatalf("secondary limit_window_seconds = %v, want 5678", usage.SecondaryWindowSeconds)
+	}
+}
+
+func TestKeeperQuotaWindowUsageUsesCurrentWindowBoundariesAndPricing(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	insertKeeperTestPrice(t, app)
+	now := time.Date(2026, 5, 18, 12, 30, 0, 0, appTimeLocation)
+	resetAt := time.Date(2026, 5, 18, 13, 0, 0, 0, appTimeLocation)
+	windowSeconds := 3600
+	windowStart := resetAt.Add(-time.Duration(windowSeconds) * time.Second)
+	accounts := []keeperAccount{
+		{
+			Name:                 "priced.json",
+			Email:                stringPtr("priced@example.com"),
+			AccountType:          stringPtr("plus"),
+			PrimaryUsedPercent:   intPtrValue(100),
+			PrimaryResetAt:       timePtrValue(resetAt),
+			PrimaryWindowSeconds: intPtrValue(windowSeconds),
+		},
+	}
+	insertKeeperWindowUsageRecord(t, app, keeperWindowUsageSeed{
+		Dedupe:       "at-start",
+		Timestamp:    windowStart,
+		Source:       "priced@example.com",
+		InputTokens:  10,
+		OutputTokens: 5,
+		RawJSON:      `{"source":"priced@example.com"}`,
+	})
+	insertKeeperWindowUsageRecord(t, app, keeperWindowUsageSeed{
+		Dedupe:       "start-grace",
+		Timestamp:    windowStart.Add(-3 * time.Second),
+		Source:       "priced@example.com",
+		InputTokens:  4,
+		OutputTokens: 1,
+		RawJSON:      `{"source":"priced@example.com"}`,
+	})
+	insertKeeperWindowUsageRecord(t, app, keeperWindowUsageSeed{
+		Dedupe:       "before-end",
+		Timestamp:    resetAt.Add(-time.Second),
+		Source:       "priced@example.com",
+		Failed:       true,
+		InputTokens:  20,
+		OutputTokens: 10,
+		RawJSON:      `{"source":"priced@example.com"}`,
+	})
+	insertKeeperWindowUsageRecord(t, app, keeperWindowUsageSeed{
+		Dedupe:       "at-end",
+		Timestamp:    resetAt,
+		Source:       "priced@example.com",
+		InputTokens:  100,
+		OutputTokens: 100,
+		RawJSON:      `{"source":"priced@example.com"}`,
+	})
+	insertKeeperWindowUsageRecord(t, app, keeperWindowUsageSeed{
+		Dedupe:       "before-start",
+		Timestamp:    windowStart.Add(-keeperQuotaWindowStartGrace - time.Second),
+		Source:       "priced@example.com",
+		InputTokens:  100,
+		OutputTokens: 100,
+		RawJSON:      `{"source":"priced@example.com"}`,
+	})
+
+	usages, err := app.computeKeeperQuotaWindowUsages(context.Background(), accounts, now)
+	if err != nil {
+		t.Fatalf("compute window usages: %v", err)
+	}
+	usage := usages["priced.json"].Primary
+	if usage == nil {
+		t.Fatal("primary window usage is nil")
+	}
+	if usage.Records != 3 || usage.SuccessRecords != 2 || usage.FailedRecords != 1 {
+		t.Fatalf("records = %d/%d/%d, want 3/2/1", usage.Records, usage.SuccessRecords, usage.FailedRecords)
+	}
+	if usage.InputTokens != 34 || usage.OutputTokens != 16 || usage.TotalTokens != 50 {
+		t.Fatalf("tokens = input %d output %d total %d, want 34/16/50", usage.InputTokens, usage.OutputTokens, usage.TotalTokens)
+	}
+	if math.Abs(usage.EstimatedCostUSD-0.000066) > 0.00000001 {
+		t.Fatalf("estimated cost = %.8f, want 0.00006600", usage.EstimatedCostUSD)
+	}
+	if usage.UnpricedRecords != 0 {
+		t.Fatalf("unpriced records = %d, want 0", usage.UnpricedRecords)
+	}
+}
+
+func TestKeeperQuotaWindowUsageDoesNotApplyStartGraceWhenQuotaNotFull(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	now := time.Date(2026, 5, 18, 12, 30, 0, 0, appTimeLocation)
+	resetAt := now.Add(time.Duration(keeperWeekWindowSeconds) * time.Second)
+	windowStart := resetAt.Add(-time.Duration(keeperWeekWindowSeconds) * time.Second)
+	accounts := []keeperAccount{
+		{
+			Name:               "refreshed.json",
+			Email:              stringPtr("refreshed@example.com"),
+			AccountType:        stringPtr("free"),
+			PrimaryUsedPercent: intPtrValue(0),
+			PrimaryResetAt:     timePtrValue(resetAt),
+		},
+	}
+	insertKeeperWindowUsageRecord(t, app, keeperWindowUsageSeed{
+		Dedupe:       "previous-cycle-boundary",
+		Timestamp:    windowStart.Add(-3 * time.Second),
+		Source:       "refreshed@example.com",
+		InputTokens:  100,
+		OutputTokens: 50,
+		RawJSON:      `{"source":"refreshed@example.com"}`,
+	})
+
+	usages, err := app.computeKeeperQuotaWindowUsages(context.Background(), accounts, now)
+	if err != nil {
+		t.Fatalf("compute window usages: %v", err)
+	}
+	usage := usages["refreshed.json"].Primary
+	if usage == nil {
+		t.Fatal("primary window usage is nil")
+	}
+	if usage.Records != 0 || usage.TotalTokens != 0 {
+		t.Fatalf("usage = records %d tokens %d, want no previous-cycle usage", usage.Records, usage.TotalTokens)
+	}
 }
 
 func TestAutomaticKeeperRunsRespectCacheButManualRefreshBypasses(t *testing.T) {
@@ -460,6 +714,79 @@ func insertKeeperUsageRecord(t *testing.T, app *App, dedupe string, timestamp ti
 	}
 }
 
+type keeperWindowUsageSeed struct {
+	Dedupe       string
+	Timestamp    time.Time
+	Source       string
+	AuthIndex    string
+	Failed       bool
+	InputTokens  int
+	OutputTokens int
+	RawJSON      string
+}
+
+func insertKeeperWindowUsageRecord(t *testing.T, app *App, seed keeperWindowUsageSeed) {
+	t.Helper()
+	now := dbTime(time.Now().In(appTimeLocation))
+	source := seed.Source
+	if strings.TrimSpace(source) == "" {
+		source = "test"
+	}
+	rawJSON := seed.RawJSON
+	if strings.TrimSpace(rawJSON) == "" {
+		rawJSON = `{}`
+	}
+	authIndex := strings.TrimSpace(seed.AuthIndex)
+	sourceAccount := sourceAccountFromUsageSource(&source)
+	inputTokens := seed.InputTokens
+	outputTokens := seed.OutputTokens
+	totalTokens := inputTokens + outputTokens
+	_, err := app.db.Exec(`
+		INSERT INTO usage_records (
+			created_at, timestamp, usage_username, api_key_description, provider,
+			model, endpoint, source, source_account, request_id, auth, auth_index, latency_ms,
+			failed, input_tokens, output_tokens, cached_tokens, reasoning_tokens,
+			total_tokens, dedupe_key, raw_json
+		) VALUES (?, ?, NULL, NULL, 'codex', 'gpt-test', '/v1/responses',
+			?, ?, ?, 'api_key', ?, 10, ?, ?, ?, 0, 0, ?, ?, ?)
+	`, now, dbTime(seed.Timestamp), source, nullableTestString(sourceAccount), seed.Dedupe, nullableBlankTestString(authIndex), seed.Failed, inputTokens, outputTokens, totalTokens, "quota-"+seed.Dedupe, rawJSON)
+	if err != nil {
+		t.Fatalf("insert quota usage record %s: %v", seed.Dedupe, err)
+	}
+}
+
+func insertKeeperTestPrice(t *testing.T, app *App) {
+	t.Helper()
+	_, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			provider, model, input_usd_per_million, output_usd_per_million,
+			cached_usd_per_million, reasoning_usd_per_million, source, updated_at
+		) VALUES ('codex', 'gpt-test', 1, 2, 0, 0, 'manual', ?)
+		ON CONFLICT(provider, model) DO UPDATE SET
+			input_usd_per_million = excluded.input_usd_per_million,
+			output_usd_per_million = excluded.output_usd_per_million,
+			updated_at = excluded.updated_at
+	`, dbTime(time.Now().In(appTimeLocation)))
+	if err != nil {
+		t.Fatalf("insert test price: %v", err)
+	}
+}
+
+func nullableTestString(value *string) any {
+	if value == nil || strings.TrimSpace(*value) == "" {
+		return nil
+	}
+	return *value
+}
+
+func nullableBlankTestString(value string) any {
+	normalized := strings.TrimSpace(value)
+	if normalized == "" {
+		return nil
+	}
+	return normalized
+}
+
 func insertKeeperStateForCandidate(t *testing.T, app *App, name string, primaryResetAt *time.Time, lastCheckedAt *time.Time) {
 	t.Helper()
 	insertKeeperStateForCandidateWithEmail(t, app, name, nil, primaryResetAt, lastCheckedAt)
@@ -488,6 +815,10 @@ func stringPtr(value string) *string {
 }
 
 func timePtrValue(value time.Time) *time.Time {
+	return &value
+}
+
+func intPtrValue(value int) *int {
 	return &value
 }
 

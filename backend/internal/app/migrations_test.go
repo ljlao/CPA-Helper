@@ -27,8 +27,8 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	if err := app.db.QueryRow(`SELECT MAX(version_id) FROM goose_db_version`).Scan(&version); err != nil {
 		t.Fatalf("query goose version: %v", err)
 	}
-	if version != 202605160003 {
-		t.Fatalf("goose version = %d, want 202605160003", version)
+	if version != 202605180001 {
+		t.Fatalf("goose version = %d, want 202605180001", version)
 	}
 }
 

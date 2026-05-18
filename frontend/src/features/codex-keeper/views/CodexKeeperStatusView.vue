@@ -45,8 +45,18 @@ import {
   refreshCodexKeeperAccounts,
   updateCodexKeeperPriority,
 } from '@/features/codex-keeper/api/codexKeeperApi'
-import type { CodexKeeperAccount, CodexKeeperPriorityRule } from '@/shared/types/api'
-import { BEIJING_TIME_ZONE, formatDateTime, formatInteger } from '@/shared/utils/format'
+import type {
+  CodexKeeperAccount,
+  CodexKeeperPriorityRule,
+  CodexKeeperQuotaWindowUsage,
+} from '@/shared/types/api'
+import {
+  BEIJING_TIME_ZONE,
+  formatCompact,
+  formatDateTime,
+  formatInteger,
+  formatUsd,
+} from '@/shared/utils/format'
 
 type FixedPriorityFilter = 'all' | 'high' | 'minusOne' | 'low'
 type PriorityTypeFilter = `type:${string}`
@@ -59,7 +69,13 @@ type SortDirection = 'asc' | 'desc'
 type PriorityMode = 'low' | 'high' | 'default'
 type AccountAction = 'toggle' | 'priority' | 'delete' | 'refresh'
 type AccountConfirmType = 'default' | 'warning' | 'error' | 'primary'
-type QuotaWindowItem = { label: string; remainingPercent: number; resetAt: string | null }
+type QuotaWindowItem = {
+  label: string
+  remainingPercent: number
+  resetAt: string | null
+  usage: CodexKeeperQuotaWindowUsage | null
+}
+type QuotaUsageTag = { label: string; value: string; tone?: 'stale' }
 type AccountStatusPreferences = {
   displaySize?: unknown
   viewMode?: unknown
@@ -74,7 +90,7 @@ const ACCOUNT_TABLE_MIN_ROW_HEIGHT = 52
 const ACCOUNT_TABLE_MAX_HEIGHT = 'min(620px, max(320px, calc(100dvh - 430px)))'
 const ACCOUNT_TABLE_VIRTUAL_THRESHOLD = 200
 const disabledTableScrollX = 1302
-const normalTableScrollX = 1526
+const normalTableScrollX = 1816
 const REFRESH_STATUS_POLL_INTERVAL_MS = 1500
 const message = useMessage()
 const isLoading = ref(false)
@@ -641,9 +657,12 @@ function isPaidQuotaWindowAccount(accountType: string | null): boolean {
   return normalized === 'plus' || normalized === 'team' || normalized?.startsWith('pro') === true
 }
 
+function isFreeQuotaWindowAccount(accountType: string | null): boolean {
+  return accountType?.trim().toLowerCase() === 'free'
+}
+
 function quotaWindowLabels(accountType: string | null): { primary: string; secondary: string } {
-  const normalized = accountType?.trim().toLowerCase()
-  if (normalized === 'free') {
+  if (isFreeQuotaWindowAccount(accountType)) {
     return { primary: '周限额', secondary: '次限额' }
   }
   if (isPaidQuotaWindowAccount(accountType)) {
@@ -666,13 +685,15 @@ function quotaWindowItems(account: CodexKeeperAccount): QuotaWindowItem[] {
       label: labels.primary,
       remainingPercent: remainingQuotaPercent(account.primary_used_percent),
       resetAt: account.primary_reset_at,
+      usage: account.primary_window_usage,
     },
   ]
-  if (account.secondary_used_percent !== null) {
+  if (account.secondary_used_percent !== null && !isFreeQuotaWindowAccount(account.account_type)) {
     items.push({
       label: labels.secondary,
       remainingPercent: remainingQuotaPercent(account.secondary_used_percent),
       resetAt: account.secondary_reset_at,
+      usage: account.secondary_window_usage,
     })
   }
   return items
@@ -685,7 +706,7 @@ function quotaSortRemainingPercent(account: CodexKeeperAccount, key: AccountSort
   const normalized = account.account_type?.trim().toLowerCase()
   if (key === 'quotaDay') {
     if (normalized === 'free') {
-      return nullableRemainingQuotaPercent(account.secondary_used_percent)
+      return null
     }
     return nullableRemainingQuotaPercent(account.primary_used_percent)
   }
@@ -744,11 +765,56 @@ function quotaText(account: CodexKeeperAccount): string {
   return items
     .map((item) => {
       const resetTime = formatQuotaResetTime(item.resetAt)
+      const usageText = quotaWindowUsageText(item)
       return resetTime
-        ? `${item.label}剩余 ${item.remainingPercent}%，刷新 ${resetTime}`
-        : `${item.label}剩余 ${item.remainingPercent}%`
+        ? `${item.label}剩余 ${item.remainingPercent}%，刷新 ${resetTime}，${usageText}`
+        : `${item.label}剩余 ${item.remainingPercent}%，${usageText}`
     })
     .join(' / ')
+}
+
+function quotaWindowUsageText(item: QuotaWindowItem): string {
+  if (!item.resetAt || item.usage?.stale === true) {
+    return '额度数据需刷新'
+  }
+  if (!item.usage) {
+    return '本窗口暂无用量'
+  }
+  return `${formatInteger(item.usage.records)} 次 / ${formatCompact(item.usage.total_tokens)} Tokens / ${formatUsd(item.usage.estimated_cost_usd)}`
+}
+
+function quotaWindowUsageTags(item: QuotaWindowItem): QuotaUsageTag[] {
+  if (!item.resetAt || item.usage?.stale === true) {
+    return [{ label: '状态', value: '需刷新', tone: 'stale' }]
+  }
+  const usage = item.usage
+  return [
+    { label: '请求', value: formatInteger(usage?.records ?? 0) },
+    { label: 'Tokens', value: formatCompact(usage?.total_tokens ?? 0) },
+    { label: '费用', value: formatUsd(usage?.estimated_cost_usd ?? 0) },
+  ]
+}
+
+function quotaWindowResetText(item: QuotaWindowItem): string {
+  const resetTime = formatQuotaResetTime(item.resetAt)
+  return resetTime ? `刷新 ${resetTime}` : '未记录刷新时间'
+}
+
+function quotaWindowUsageTitle(item: QuotaWindowItem): string {
+  const usage = item.usage
+  if (!item.resetAt || usage?.stale === true) {
+    return `${item.label} 额度数据需刷新`
+  }
+  if (!usage) {
+    return `${item.label} 本窗口暂无用量`
+  }
+  const unpriced =
+    usage.unpriced_records > 0 ? `，未计价 ${formatInteger(usage.unpriced_records)} 条` : ''
+  return `${item.label} 当前窗口：${formatInteger(usage.records)} 次请求，${formatCompact(usage.total_tokens)} Tokens，${formatUsd(usage.estimated_cost_usd)}${unpriced}`
+}
+
+function quotaWindowUsageTone(item: QuotaWindowItem): string {
+  return !item.resetAt || item.usage?.stale === true ? 'is-stale' : ''
 }
 
 function latestActionText(account: CodexKeeperAccount): string {
@@ -794,8 +860,8 @@ function renderQuotaCell(account: CodexKeeperAccount) {
         {
           class: 'quota-window-item',
           title: resetTime
-            ? `${item.label}剩余 ${item.remainingPercent}%，刷新 ${resetTime}`
-            : `${item.label}剩余 ${item.remainingPercent}%`,
+            ? `${item.label}剩余 ${item.remainingPercent}%，刷新 ${resetTime}；${quotaWindowUsageTitle(item)}`
+            : `${item.label}剩余 ${item.remainingPercent}%；${quotaWindowUsageTitle(item)}`,
         },
         [
           h('div', { class: 'quota-window-head' }, [
@@ -814,6 +880,36 @@ function renderQuotaCell(account: CodexKeeperAccount) {
         ],
       )
     }),
+  )
+}
+
+function renderQuotaUsageCell(account: CodexKeeperAccount) {
+  const items = quotaWindowItems(account)
+  if (items.length === 0) {
+    return '-'
+  }
+  return h(
+    'div',
+    { class: 'quota-usage-cell' },
+    items.map((item) =>
+      h(
+        'div',
+        {
+          class: ['quota-usage-item', quotaWindowUsageTone(item)],
+          title: quotaWindowUsageTitle(item),
+        },
+        quotaWindowUsageTags(item).map((tag) =>
+          h(
+            'span',
+            { class: ['quota-usage-chip', tag.tone ? `is-${tag.tone}` : undefined] },
+            [
+              h('span', { class: 'quota-usage-chip-label' }, tag.label),
+              h('strong', { class: 'quota-usage-chip-value' }, tag.value),
+            ],
+          ),
+        ),
+      ),
+    ),
   )
 }
 
@@ -1309,6 +1405,12 @@ const baseColumns: DataTableColumns<CodexKeeperAccount> = [
     render: (row) => renderQuotaCell(row),
   },
   {
+    title: '窗口用量',
+    key: 'quota_usage',
+    width: 280,
+    render: (row) => renderQuotaUsageCell(row),
+  },
+  {
     title: '最近巡检',
     key: 'last_checked_at',
     width: 150,
@@ -1323,7 +1425,7 @@ const baseColumns: DataTableColumns<CodexKeeperAccount> = [
 ]
 
 const disabledBaseColumns: DataTableColumns<CodexKeeperAccount> = baseColumns.filter(
-  (column) => !('key' in column) || column.key !== 'quota',
+  (column) => !('key' in column) || (column.key !== 'quota' && column.key !== 'quota_usage'),
 )
 
 const disabledActionColumn: DataTableColumns<CodexKeeperAccount>[number] = {
@@ -1772,7 +1874,10 @@ onBeforeUnmount(() => {
           <div
             v-else
             class="account-card-grid"
-            :class="{ 'is-bar': isBarCardView, 'is-ring': !isBarCardView }"
+            :class="{
+              'is-bar': isBarCardView,
+              'is-ring': !isBarCardView,
+            }"
           >
             <button
               v-for="account in visibleCardAccounts"
@@ -1847,7 +1952,7 @@ onBeforeUnmount(() => {
                     >
                       <div class="card-quota-head">
                         <span>{{ item.label }}</span>
-                        <strong>{{ item.remainingPercent }}%</strong>
+                        <strong>剩余 {{ item.remainingPercent }}%</strong>
                       </div>
                       <div class="card-quota-track">
                         <div
@@ -1857,8 +1962,19 @@ onBeforeUnmount(() => {
                         />
                       </div>
                       <span class="card-quota-reset">
-                        {{ formatQuotaResetTime(item.resetAt) ?? '未记录刷新时间' }}
+                        {{ quotaWindowResetText(item) }}
                       </span>
+                      <div class="card-quota-usage-tags" :title="quotaWindowUsageTitle(item)">
+                        <span
+                          v-for="tag in quotaWindowUsageTags(item)"
+                          :key="`${item.label}-${tag.label}`"
+                          class="card-quota-usage-tag"
+                          :class="tag.tone ? `is-${tag.tone}` : undefined"
+                        >
+                          <span>{{ tag.label }}</span>
+                          <strong>{{ tag.value }}</strong>
+                        </span>
+                      </div>
                     </div>
                   </template>
                   <div v-else class="card-quota-rings">
@@ -1867,16 +1983,29 @@ onBeforeUnmount(() => {
                       :key="item.label"
                       class="card-quota-ring-item"
                     >
-                      <div
-                        class="quota-ring"
-                        :class="quotaBarTone(item.remainingPercent)"
-                        :style="{ '--quota-deg': `${item.remainingPercent * 3.6}deg` }"
-                      >
-                        <span>{{ item.remainingPercent }}%</span>
+                      <div class="card-quota-ring-head">
+                        <div
+                          class="quota-ring"
+                          :class="quotaBarTone(item.remainingPercent)"
+                          :style="{ '--quota-deg': `${item.remainingPercent * 3.6}deg` }"
+                        >
+                          <span>{{ item.remainingPercent }}%</span>
+                        </div>
+                        <div class="quota-ring-caption">
+                          <strong>{{ item.label }}</strong>
+                          <span>{{ quotaWindowResetText(item) }}</span>
+                        </div>
                       </div>
-                      <div class="quota-ring-caption">
-                        <strong>{{ item.label }}</strong>
-                        <span>{{ formatQuotaResetTime(item.resetAt) ?? '未记录刷新时间' }}</span>
+                      <div class="card-quota-usage-tags" :title="quotaWindowUsageTitle(item)">
+                        <span
+                          v-for="tag in quotaWindowUsageTags(item)"
+                          :key="`${item.label}-${tag.label}`"
+                          class="card-quota-usage-tag"
+                          :class="tag.tone ? `is-${tag.tone}` : undefined"
+                        >
+                          <span>{{ tag.label }}</span>
+                          <strong>{{ tag.value }}</strong>
+                        </span>
                       </div>
                     </div>
                   </div>
@@ -2337,13 +2466,23 @@ onBeforeUnmount(() => {
 
 .account-card-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
   gap: 10px;
+}
+
+.account-card-grid.is-bar {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
+}
+
+.account-card-grid.is-ring {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
 }
 
 .account-card {
   display: grid;
+  align-content: start;
   gap: 12px;
+  width: 100%;
   min-width: 0;
   min-height: 176px;
   padding: 12px;
@@ -2538,51 +2677,150 @@ onBeforeUnmount(() => {
 
 .account-card-quota {
   display: grid;
-  gap: 8px;
+  gap: 10px;
   min-width: 0;
+  padding-top: 2px;
 }
 
 .card-quota-bar {
   display: grid;
-  gap: 5px;
+  gap: 7px;
   min-width: 0;
+  padding-top: 9px;
+  border-top: 1px solid color-mix(in srgb, var(--cpa-border) 70%, transparent);
+}
+
+.card-quota-bar:first-child {
+  padding-top: 0;
+  border-top: 0;
 }
 
 .card-quota-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
   gap: 8px;
   min-width: 0;
+  line-height: 1.2;
 }
 
-.card-quota-head span,
+.card-quota-head span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--cpa-text);
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .card-quota-reset {
   overflow: hidden;
   color: var(--cpa-text-muted);
   font-size: 11px;
+  line-height: 1.35;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .card-quota-head strong {
   flex-shrink: 0;
-  color: var(--cpa-text);
-  font-size: 12px;
+  padding: 2px 7px;
+  color: var(--cpa-text-strong);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.35;
+  background: color-mix(in srgb, var(--cpa-text-muted) 9%, transparent);
+  border-radius: 999px;
   font-variant-numeric: tabular-nums;
 }
 
-.card-quota-track {
-  height: 6px;
+.card-quota-usage-tags {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(68px, 1fr));
+  gap: 6px;
+  min-width: 0;
+}
+
+.card-quota-bar .card-quota-usage-tags {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.card-quota-usage-tag {
+  --usage-accent: var(--cpa-primary);
+  display: grid;
+  align-content: space-between;
+  gap: 4px;
+  min-width: 0;
+  min-height: 42px;
   overflow: hidden;
-  background: var(--cpa-surface-muted);
+  padding: 7px 8px 6px;
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--usage-accent) 5%, var(--cpa-surface-raised)),
+      color-mix(in srgb, var(--cpa-surface-muted) 88%, var(--cpa-surface-raised))
+    );
+  border: 1px solid color-mix(in srgb, var(--usage-accent) 18%, var(--cpa-border));
+  border-radius: var(--cpa-radius-sm);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--cpa-surface-raised) 70%, transparent);
+}
+
+.card-quota-usage-tag:nth-child(2) {
+  --usage-accent: var(--cpa-accent-blue);
+}
+
+.card-quota-usage-tag:nth-child(3) {
+  --usage-accent: var(--cpa-accent-orange);
+}
+
+.card-quota-usage-tag span,
+.card-quota-usage-tag strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card-quota-usage-tag span {
+  color: color-mix(in srgb, var(--usage-accent) 62%, var(--cpa-text-muted));
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+.card-quota-usage-tag strong {
+  color: var(--cpa-text-strong);
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+.card-quota-usage-tag.is-stale {
+  --usage-accent: var(--cpa-warning);
+  grid-column: 1 / -1;
+  background: color-mix(in srgb, var(--cpa-warning) 9%, var(--cpa-surface-raised));
+  border-color: color-mix(in srgb, var(--cpa-warning) 20%, var(--cpa-border));
+}
+
+.card-quota-usage-tag.is-stale strong {
+  color: var(--cpa-warning);
+}
+
+.card-quota-track {
+  height: 8px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--cpa-text-muted) 8%, var(--cpa-surface-muted));
+  border: 1px solid color-mix(in srgb, var(--cpa-border) 68%, transparent);
   border-radius: 999px;
 }
 
 .card-quota-fill {
   height: 100%;
-  min-width: 3px;
+  min-width: 0;
   border-radius: inherit;
+  box-shadow: inset 0 -1px 0 color-mix(in srgb, #000 14%, transparent);
 }
 
 .card-quota-fill.is-healthy,
@@ -2605,26 +2843,40 @@ onBeforeUnmount(() => {
 }
 
 .card-quota-rings {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: 1fr;
   gap: 10px;
 }
 
 .card-quota-ring-item {
   display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px;
+  background: color-mix(in srgb, var(--cpa-surface-muted) 72%, var(--cpa-surface-raised));
+  border: 1px solid color-mix(in srgb, var(--cpa-border) 72%, transparent);
+  border-radius: var(--cpa-radius-sm);
+}
+
+.card-quota-ring-head {
+  display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
   gap: 8px;
-  min-width: 132px;
-  flex: 1 1 132px;
+  min-width: 0;
+}
+
+.card-quota-ring-item .card-quota-usage-tags {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .quota-ring {
   --quota-color: var(--cpa-success);
   display: grid;
   position: relative;
-  width: 54px;
-  height: 54px;
+  width: 48px;
+  height: 48px;
   flex-shrink: 0;
   place-items: center;
   overflow: hidden;
@@ -2634,11 +2886,12 @@ onBeforeUnmount(() => {
       color-mix(in srgb, var(--cpa-text-muted) 18%, transparent) 0
     );
   border-radius: 50%;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--cpa-border) 70%, transparent);
 }
 
 .quota-ring::before {
   position: absolute;
-  inset: 6px;
+  inset: 5px;
   content: "";
   background: var(--cpa-surface-raised);
   border-radius: inherit;
@@ -2654,7 +2907,7 @@ onBeforeUnmount(() => {
 
 .quota-ring-caption {
   display: grid;
-  gap: 2px;
+  gap: 4px;
   min-width: 0;
 }
 
@@ -2740,8 +2993,10 @@ onBeforeUnmount(() => {
 
 :global(.quota-window-item) {
   display: grid;
+  align-content: center;
   gap: 4px;
   min-width: 0;
+  min-height: 38px;
 }
 
 :global(.quota-window-head) {
@@ -2783,6 +3038,96 @@ onBeforeUnmount(() => {
   color: var(--cpa-text-muted);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
+}
+
+:global(.quota-window-usage) {
+  overflow: hidden;
+  color: var(--cpa-text-muted);
+  font-size: 11px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:global(.quota-window-usage.is-stale) {
+  color: var(--cpa-warning);
+}
+
+:global(.quota-usage-cell) {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 4px 0;
+}
+
+:global(.quota-usage-item) {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  min-width: 0;
+  min-height: 38px;
+}
+
+:global(.quota-usage-chip) {
+  --usage-accent: var(--cpa-primary);
+  display: grid;
+  align-content: center;
+  gap: 2px;
+  min-width: 0;
+  min-height: 38px;
+  padding: 6px 7px;
+  overflow: hidden;
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--usage-accent) 5%, var(--cpa-surface-raised)),
+      color-mix(in srgb, var(--cpa-surface-muted) 90%, var(--cpa-surface-raised))
+    );
+  border: 1px solid color-mix(in srgb, var(--usage-accent) 18%, var(--cpa-border));
+  border-radius: var(--cpa-radius-sm);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--cpa-surface-raised) 70%, transparent);
+}
+
+:global(.quota-usage-chip:nth-child(2)) {
+  --usage-accent: var(--cpa-accent-blue);
+}
+
+:global(.quota-usage-chip:nth-child(3)) {
+  --usage-accent: var(--cpa-accent-orange);
+}
+
+:global(.quota-usage-chip-label),
+:global(.quota-usage-chip-value) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:global(.quota-usage-chip-label) {
+  color: color-mix(in srgb, var(--usage-accent) 62%, var(--cpa-text-muted));
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+:global(.quota-usage-chip-value) {
+  color: var(--cpa-text-strong);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+:global(.quota-usage-chip.is-stale) {
+  --usage-accent: var(--cpa-warning);
+  grid-column: 1 / -1;
+  background: color-mix(in srgb, var(--cpa-warning) 9%, var(--cpa-surface-raised));
+  border-color: color-mix(in srgb, var(--cpa-warning) 20%, var(--cpa-border));
+}
+
+:global(.quota-usage-chip.is-stale .quota-usage-chip-value) {
+  color: var(--cpa-warning);
 }
 
 :global(.quota-window-track) {
