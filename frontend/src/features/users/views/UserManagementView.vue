@@ -8,6 +8,7 @@ import {
   NForm,
   NFormItem,
   NInput,
+  NInputNumber,
   NModal,
   NPopconfirm,
   NSpace,
@@ -18,7 +19,14 @@ import {
 } from 'naive-ui'
 import { CircleDollarSign, KeyRound, ShieldCheck, UserRound } from 'lucide-vue-next'
 
-import { createUser, disableUser, enableUser, listUsers, updateUser } from '@/features/users/api/usersApi'
+import {
+  createUser,
+  disableUser,
+  enableUser,
+  listUsers,
+  updateUser,
+  updateUserQuota,
+} from '@/features/users/api/usersApi'
 import type { UserSummary } from '@/shared/types/api'
 import { formatCompact, formatDateTime, formatInteger, formatUsd } from '@/shared/utils/format'
 
@@ -32,6 +40,9 @@ const userAccount = ref('')
 const userPassword = ref('')
 const isUserAdmin = ref(false)
 const userNickname = ref('')
+const quotaUnlimited = ref(true)
+const quotaLifetimeUsd = ref(0)
+const quotaMonthlyUsd = ref(0)
 const isEditingFirstUser = computed(() => editingUserId.value === 1)
 
 interface UserMetricCard {
@@ -88,6 +99,38 @@ function userLabel(row: UserSummary): string {
   return row.nickname.trim() || row.username.trim() || '未知用户'
 }
 
+function quotaBalanceValue(row: UserSummary, bucket: 'monthly' | 'lifetime'): string {
+  if (row.quota.unlimited) {
+    return '无限制'
+  }
+
+  const value = bucket === 'monthly' ? row.quota.monthly_remaining_usd : row.quota.lifetime_remaining_usd
+  return formatUsd(value)
+}
+
+function quotaBalanceClass(row: UserSummary): string {
+  if (row.quota.paused || !row.quota.can_create_keys) {
+    return 'is-error'
+  }
+  if (row.quota.unpriced_records > 0) {
+    return 'is-warning'
+  }
+  return row.quota.unlimited ? 'is-unlimited' : 'is-normal'
+}
+
+function quotaDetail(row: UserSummary): string | null {
+  if (row.quota.paused) {
+    return 'Key 已因余额暂停'
+  }
+  if (row.quota.sync_error) {
+    return '同步异常'
+  }
+  if (row.quota.unpriced_records > 0) {
+    return `未定价 ${formatInteger(row.quota.unpriced_records)} 条`
+  }
+  return null
+}
+
 function todayRequestDetail(row: UserSummary): string {
   if (!row.today_records) {
     return `累计 ${formatInteger(row.records)}`
@@ -117,12 +160,23 @@ function lastProviderLabel(row: UserSummary): string {
   return row.last_provider ?? '未知服务商'
 }
 
+function setQuotaLifetimeUsd(value: number | null) {
+  quotaLifetimeUsd.value = value ?? 0
+}
+
+function setQuotaMonthlyUsd(value: number | null) {
+  quotaMonthlyUsd.value = value ?? 0
+}
+
 function resetEditor() {
   editingUserId.value = null
   userAccount.value = ''
   userPassword.value = ''
   isUserAdmin.value = false
   userNickname.value = ''
+  quotaUnlimited.value = true
+  quotaLifetimeUsd.value = 0
+  quotaMonthlyUsd.value = 0
 }
 
 function openCreateUser() {
@@ -137,6 +191,9 @@ function editUser(row: UserSummary) {
   userPassword.value = ''
   isUserAdmin.value = row.id === 1 ? true : row.is_admin
   userNickname.value = row.nickname
+  quotaUnlimited.value = row.quota.unlimited
+  quotaLifetimeUsd.value = row.quota.lifetime_quota_usd ?? 0
+  quotaMonthlyUsd.value = row.quota.monthly_quota_usd ?? 0
   editorVisible.value = true
 }
 
@@ -200,11 +257,14 @@ async function saveUser() {
       is_admin: isEditingFirstUser.value ? true : isUserAdmin.value,
       nickname,
     }
-    if (editingUserId.value !== null) {
-      await updateUser(editingUserId.value, payload)
-    } else {
-      await createUser(payload)
-    }
+    const saved =
+      editingUserId.value !== null
+        ? await updateUser(editingUserId.value, payload)
+        : await createUser(payload)
+    await updateUserQuota(saved.id, {
+      lifetime_quota_usd: quotaUnlimited.value ? null : quotaLifetimeUsd.value,
+      monthly_quota_usd: quotaUnlimited.value ? null : quotaMonthlyUsd.value,
+    })
     message.success(isEditing ? '用户已保存' : '用户已创建')
     editorVisible.value = false
     resetEditor()
@@ -249,6 +309,33 @@ const columns: DataTableColumns<UserSummary> = [
         },
         { default: () => (isUserDisabled(row) ? '已禁用' : '启用中') },
       ),
+  },
+  {
+    title: '余额',
+    key: 'quota',
+    width: 210,
+    render: (row) => {
+      const detail = quotaDetail(row)
+      return h('div', { class: ['metric-stack', 'quota-balance-stack'] }, [
+        h('div', { class: ['quota-balance-row', 'is-monthly', quotaBalanceClass(row)] }, [
+          h('span', { class: 'quota-balance-label' }, '每月余额：'),
+          h('strong', { class: 'quota-balance-value' }, quotaBalanceValue(row, 'monthly')),
+        ]),
+        h('div', { class: ['quota-balance-row', 'is-lifetime', quotaBalanceClass(row)] }, [
+          h('span', { class: 'quota-balance-label' }, '不限时余额：'),
+          h('strong', { class: 'quota-balance-value' }, quotaBalanceValue(row, 'lifetime')),
+        ]),
+        ...(detail
+          ? [
+              h(
+                'span',
+                { class: ['metric-muted', 'quota-balance-detail', { 'is-error': row.quota.sync_error || row.quota.paused }] },
+                detail,
+              ),
+            ]
+          : []),
+      ])
+    },
   },
   {
     title: 'API KEY',
@@ -307,7 +394,7 @@ const columns: DataTableColumns<UserSummary> = [
   {
     title: '最近模型',
     key: 'last_model',
-    width: 220,
+    width: 160,
     render: (row) =>
       h('div', { class: 'metric-stack' }, [
         h('span', { class: 'model-value' }, lastModelLabel(row)),
@@ -317,7 +404,7 @@ const columns: DataTableColumns<UserSummary> = [
   {
     title: '最近使用',
     key: 'last_seen_at',
-    width: 170,
+    width: 150,
     render: (row) => formatDateTime(row.last_seen_at),
   },
   {
@@ -406,7 +493,7 @@ onMounted(refresh)
         :data="users"
         :pagination="{ pageSize: 12 }"
         table-layout="fixed"
-        :scroll-x="1890"
+        :scroll-x="2000"
       />
     </section>
 
@@ -452,6 +539,40 @@ onMounted(refresh)
         <NFormItem label="是否设为管理员">
           <NSwitch v-model:value="isUserAdmin" :disabled="isEditingFirstUser" />
         </NFormItem>
+        <NFormItem label="余额设置">
+          <div class="quota-unlimited-row">
+            <div>
+              <div class="quota-unlimited-title">不限制余额</div>
+              <div class="quota-unlimited-desc">开启后不扣余额，也不会因余额暂停 API Key。</div>
+            </div>
+            <NSwitch v-model:value="quotaUnlimited" />
+          </div>
+        </NFormItem>
+        <div class="form-grid quota-editor-grid">
+          <NFormItem label="不限时余额 USD">
+            <NInputNumber
+              :value="quotaLifetimeUsd"
+              :disabled="quotaUnlimited"
+              :min="0"
+              :precision="8"
+              placeholder="0"
+              @update:value="setQuotaLifetimeUsd"
+            />
+          </NFormItem>
+          <NFormItem label="每月余额 USD">
+            <NInputNumber
+              :value="quotaMonthlyUsd"
+              :disabled="quotaUnlimited"
+              :min="0"
+              :precision="8"
+              placeholder="0"
+              @update:value="setQuotaMonthlyUsd"
+            />
+          </NFormItem>
+        </div>
+        <NAlert type="info" :bordered="false" class="quota-editor-hint">
+          关闭不限制后，扣费顺序：先扣每月余额，不足部分再扣不限时余额；两者都无剩余时暂停该用户的 API Key。
+        </NAlert>
         <div class="user-editor-actions">
           <NButton secondary @click="editorVisible = false">取消</NButton>
           <NButton type="primary" :loading="isSavingUser" @click="saveUser">
@@ -478,11 +599,106 @@ onMounted(refresh)
   margin-bottom: 12px;
 }
 
+.quota-editor-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+}
+
+.quota-editor-hint {
+  margin: -2px 0 12px;
+}
+
+.quota-unlimited-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  gap: 16px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--cpa-border);
+  border-radius: var(--cpa-radius);
+  background: var(--cpa-surface);
+}
+
+.quota-unlimited-title {
+  color: var(--cpa-text-strong);
+  font-size: 13px;
+  font-weight: 760;
+}
+
+.quota-unlimited-desc {
+  margin-top: 2px;
+  color: var(--cpa-muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
 :global(.metric-stack) {
   display: grid;
   gap: 2px;
   min-width: 0;
   line-height: 1.28;
+}
+
+:global(.quota-balance-stack) {
+  gap: 3px;
+}
+
+:global(.quota-balance-row) {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  width: fit-content;
+  max-width: 100%;
+  padding: 2px 7px;
+  overflow: hidden;
+  border-radius: var(--cpa-radius-sm);
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+:global(.quota-balance-row.is-monthly.is-normal) {
+  background: var(--cpa-success-weak);
+  color: var(--cpa-success);
+}
+
+:global(.quota-balance-row.is-lifetime.is-normal) {
+  background: var(--cpa-primary-weak);
+  color: var(--cpa-primary);
+}
+
+:global(.quota-balance-row.is-unlimited) {
+  background: var(--cpa-primary-wash);
+  color: var(--cpa-primary);
+}
+
+:global(.quota-balance-row.is-warning) {
+  background: var(--cpa-warning-weak);
+  color: var(--cpa-warning);
+}
+
+:global(.quota-balance-row.is-error) {
+  background: var(--cpa-danger-weak);
+  color: var(--cpa-danger);
+}
+
+:global(.quota-balance-label),
+:global(.quota-balance-value) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+:global(.quota-balance-label) {
+  flex: 0 0 auto;
+  font-weight: 600;
+}
+
+:global(.quota-balance-value) {
+  font-weight: 760;
 }
 
 :global(.metric-primary) {
@@ -518,6 +734,10 @@ onMounted(refresh)
 @media (max-width: 560px) {
   .user-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .quota-editor-grid {
+    grid-template-columns: 1fr;
   }
 }
 </style>

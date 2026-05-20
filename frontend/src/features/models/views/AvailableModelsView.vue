@@ -24,6 +24,7 @@ type PriceField = keyof Pick<
   | 'cache_read_usd_per_million'
   | 'cache_creation_usd_per_million'
 >
+type BillingUnit = 'token' | 'request'
 
 const router = useRouter()
 const isLoading = ref(false)
@@ -60,7 +61,57 @@ function formatUsdPerMtok(value: number): string {
   })
 }
 
-function renderPriceValue(row: AvailableModel, field: PriceField): string {
+function billingUnitForModel(model: string): BillingUnit {
+  return model.trim().toLowerCase().includes('image') ? 'request' : 'token'
+}
+
+function modelBillingUnit(row: AvailableModel): BillingUnit {
+  if (row.price?.billing_unit === 'request') {
+    return 'request'
+  }
+  if (row.price?.billing_unit === 'token') {
+    return 'token'
+  }
+  return billingUnitForModel(row.price?.model || row.id)
+}
+
+function renderBillingUnit(row: AvailableModel) {
+  const unit = modelBillingUnit(row)
+  const isRequest = unit === 'request'
+  return h(
+    'span',
+    {
+      style: {
+        display: 'inline-flex',
+        alignItems: 'center',
+        minHeight: '22px',
+        padding: '2px 8px',
+        borderRadius: '6px',
+        background: isRequest ? 'rgba(16, 185, 129, 0.13)' : 'rgba(124, 58, 237, 0.12)',
+        color: isRequest ? '#047857' : '#6d28d9',
+        fontSize: '12px',
+        fontWeight: '600',
+        lineHeight: '1.2',
+      },
+    },
+    isRequest ? '按次' : '按 Token',
+  )
+}
+
+function renderRequestPrice(row: AvailableModel) {
+  if (modelBillingUnit(row) !== 'request') {
+    return h('span', { class: 'model-price-muted' }, '-')
+  }
+  if (row.price?.request_usd === null || row.price?.request_usd === undefined) {
+    return h('span', { class: 'model-price-muted' }, '未定价')
+  }
+  return formatUsdPerMtok(row.price.request_usd)
+}
+
+function renderPriceValue(row: AvailableModel, field: PriceField) {
+  if (modelBillingUnit(row) === 'request') {
+    return h('span', { class: 'model-price-muted' }, '-')
+  }
   if (!row.price) {
     return '-'
   }
@@ -124,6 +175,18 @@ const columns: DataTableColumns<AvailableModel> = [
             ),
         },
       ),
+  },
+  {
+    title: '计费方式',
+    key: 'billing_unit',
+    width: 110,
+    render: renderBillingUnit,
+  },
+  {
+    title: '每次 ($)',
+    key: 'request_usd',
+    width: 110,
+    render: renderRequestPrice,
   },
   {
     title: '输入 ($/MTok)',
@@ -262,7 +325,7 @@ onMounted(refresh)
             :data="response.models"
             :pagination="{ pageSize: 20 }"
             max-height="max(240px, calc(100dvh - 360px))"
-            :scroll-x="1440"
+            :scroll-x="1660"
             table-layout="fixed"
           />
         </template>
@@ -296,6 +359,10 @@ onMounted(refresh)
 .model-id {
   font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
   font-size: 13px;
+}
+
+.model-price-muted {
+  color: var(--cpa-text-muted);
 }
 
 .alert-row {

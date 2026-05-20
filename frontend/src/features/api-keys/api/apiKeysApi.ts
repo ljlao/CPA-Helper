@@ -2,6 +2,9 @@ import { apiClient } from '@/shared/api/apiClient'
 import type {
   ApiKeyCreatePayload,
   ApiKeyUpdatePayload,
+  ModelRequestGuide,
+  ModelRequestTestPayload,
+  ModelRequestTestResponse,
   UserApiKeySummary,
 } from '@/shared/types/api'
 
@@ -26,4 +29,14 @@ export function updateApiKey(
 
 export function deleteApiKey(apiKeyHash: string): Promise<void> {
   return apiClient.delete(`/api-keys/${apiKeyHash}`)
+}
+
+export function getModelRequestGuide(): Promise<ModelRequestGuide> {
+  return apiClient.get<ModelRequestGuide>('/account/model-request')
+}
+
+export function testModelRequest(
+  payload: ModelRequestTestPayload,
+): Promise<ModelRequestTestResponse> {
+  return apiClient.post<ModelRequestTestResponse>('/account/model-request/test', payload)
 }

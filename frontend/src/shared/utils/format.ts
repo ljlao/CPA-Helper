@@ -10,12 +10,13 @@ export function formatCompact(value: number): string {
   }).format(value)
 }
 
-export function formatUsd(value: number): string {
+export function formatUsd(value: number | null | undefined): string {
+  const normalized = typeof value === 'number' && Number.isFinite(value) ? value : 0
   return new Intl.NumberFormat('en-US', {
     style: 'currency',
     currency: 'USD',
-    maximumFractionDigits: value < 1 ? 6 : 2,
-  }).format(value)
+    maximumFractionDigits: normalized < 1 ? 6 : 2,
+  }).format(normalized)
 }
 
 export const BEIJING_TIME_ZONE = 'Asia/Shanghai'

@@ -3,6 +3,8 @@ import type {
   UserApiKeyBindPayload,
   UserApiKeySummary,
   UserPayload,
+  UserQuotaPayload,
+  UserQuotaStatus,
   UserSummary,
 } from '@/shared/types/api'
 
@@ -16,6 +18,14 @@ export function createUser(payload: UserPayload): Promise<UserSummary> {
 
 export function updateUser(userId: number, payload: UserPayload): Promise<UserSummary> {
   return apiClient.put<UserSummary>(`/users/${userId}`, payload)
+}
+
+export function updateUserQuota(userId: number, payload: UserQuotaPayload): Promise<UserQuotaStatus> {
+  return apiClient.put<UserQuotaStatus>(`/users/${userId}/quota`, payload)
+}
+
+export function getCurrentUserQuota(): Promise<UserQuotaStatus> {
+  return apiClient.get<UserQuotaStatus>('/account/quota')
 }
 
 export function disableUser(userId: number): Promise<void> {

@@ -31,6 +31,7 @@ const collectorStatus = ref<CollectorStatus | null>(null)
 
 const settingsForm = reactive({
   cliaproxy_url: 'http://127.0.0.1:8317',
+  model_request_url: 'http://127.0.0.1:8317',
   management_key: '',
   collector_enabled: false,
   batch_size: 100,
@@ -69,6 +70,7 @@ async function refresh() {
       getCollectorStatus(),
     ])
     settingsForm.cliaproxy_url = settings.cliaproxy_url
+    settingsForm.model_request_url = settings.model_request_url
     settingsForm.management_key = settings.management_key
     settingsForm.collector_enabled = settings.collector_enabled
     settingsForm.batch_size = settings.batch_size
@@ -87,6 +89,7 @@ async function saveSettings() {
   try {
     const payload: SettingsUpdatePayload = {
       cliaproxy_url: settingsForm.cliaproxy_url,
+      model_request_url: settingsForm.model_request_url,
       management_key: settingsForm.management_key,
       collector_enabled: settingsForm.collector_enabled,
       batch_size: settingsForm.batch_size,
@@ -161,9 +164,19 @@ onMounted(refresh)
           <h2 class="section-title">采集配置</h2>
           <NForm :model="settingsForm" label-placement="top">
             <div class="form-grid">
-              <NFormItem label="CLIProxyAPI / CPAMC 地址">
+              <div class="field-stack">
+                <div class="field-label">CLIProxyAPI 地址</div>
                 <NInput v-model:value="settingsForm.cliaproxy_url" />
-              </NFormItem>
+                <div class="form-help">用于采集队列、API Key 同步和管理接口。</div>
+              </div>
+              <div class="field-stack">
+                <div class="field-label">模型请求地址（例如：填写CPA外网地址）</div>
+                <NInput
+                  v-model:value="settingsForm.model_request_url"
+                  placeholder="例如：http://192.168.26.50:8317"
+                />
+                <div class="form-help">仅用于 API 密钥页「请求测试」生成 URL 和示例。</div>
+              </div>
               <NFormItem label="管理密钥">
                 <NInput
                   v-model:value="settingsForm.management_key"
@@ -244,7 +257,31 @@ onMounted(refresh)
 .form-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px 12px;
+  gap: 18px 12px;
+}
+
+.field-stack {
+  display: grid;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  align-content: start;
+}
+
+.field-label {
+  color: var(--cpa-text);
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.form-help {
+  margin: 0;
+  padding-left: 8px;
+  border-left: 2px solid color-mix(in srgb, var(--cpa-primary) 42%, transparent);
+  color: var(--cpa-text);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.45;
 }
 
 .status-alert {

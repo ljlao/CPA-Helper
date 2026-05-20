@@ -29,6 +29,7 @@ export interface FirstAdminSetupPayload {
 
 export interface SettingsResponse {
   cliaproxy_url: string
+  model_request_url: string
   management_key: string
   management_key_set: boolean
   collector_enabled: boolean
@@ -40,12 +41,37 @@ export interface SettingsResponse {
 
 export interface SettingsUpdatePayload {
   cliaproxy_url?: string
+  model_request_url?: string
   management_key?: string
   collector_enabled?: boolean
   queue_name?: string
   batch_size?: number
   poll_interval_seconds?: number
   retry_interval_seconds?: number
+}
+
+export interface ModelRequestGuide {
+  model_request_url: string
+  openai_base_url: string
+  chat_completions_url: string
+}
+
+export type ModelRequestEndpoint = 'chat_completions' | 'responses' | 'claude_messages'
+
+export interface ModelRequestTestPayload {
+  api_key_hash: string
+  endpoint: ModelRequestEndpoint
+  model: string
+  message: string
+}
+
+export interface ModelRequestTestResponse {
+  endpoint: ModelRequestEndpoint
+  model: string
+  reply: string
+  status_code: number
+  duration_ms: number
+  usage?: Record<string, unknown>
 }
 
 export interface CollectorStatus {
@@ -327,6 +353,8 @@ export interface ModelPrice {
   output_usd_per_million: number
   cache_read_usd_per_million: number
   cache_creation_usd_per_million: number
+  request_usd: number | null
+  billing_unit: 'token' | 'request' | string
   source: 'manual' | 'litellm' | string
   source_model: string | null
   auto_synced: boolean
@@ -341,6 +369,7 @@ export interface ModelPricePayload {
   output_usd_per_million: number
   cache_read_usd_per_million: number
   cache_creation_usd_per_million: number
+  request_usd: number | null
 }
 
 export interface ModelPriceSyncResponse {
@@ -352,6 +381,28 @@ export interface ModelPriceSyncResponse {
   unchanged: number
   skipped_manual: number
   skipped_invalid: number
+}
+
+export interface ModelPriceCatalogItem {
+  id: string
+  name: string
+  object: string | null
+  owner: string | null
+  created: number | null
+  metadata: Record<string, string | number | boolean | null>
+  suggested_provider: string
+  price: ModelPrice | null
+  sources: AvailableModelSource[]
+}
+
+export interface ModelPriceCatalogResponse {
+  has_api_keys: boolean
+  api_key_count: number
+  queryable_api_key_count: number
+  models: ModelPriceCatalogItem[]
+  errors: AvailableModelKeyError[]
+  priced_models: number
+  unpriced_models: number
 }
 
 export interface LiteLLMProxySettings {
@@ -394,10 +445,29 @@ export interface UserApiKeySummary {
   models: string[]
 }
 
+export interface UserQuotaStatus {
+  unlimited: boolean
+  lifetime_quota_usd: number | null
+  lifetime_remaining_usd: number | null
+  monthly_quota_usd: number | null
+  monthly_used_usd: number
+  monthly_remaining_usd: number | null
+  quota_month: string
+  paused: boolean
+  paused_at: string | null
+  pause_reason: string | null
+  sync_error: string | null
+  unpriced_records: number
+  can_create_keys: boolean
+  started_at: string | null
+}
+
 export interface AvailableModelSource {
   api_key_hash: string
   api_key_preview: string
   description: string
+  user_id?: number
+  user_label?: string
 }
 
 export interface AvailableModelPrice {
@@ -407,6 +477,8 @@ export interface AvailableModelPrice {
   output_usd_per_million: number
   cache_read_usd_per_million: number
   cache_creation_usd_per_million: number
+  request_usd: number | null
+  billing_unit: 'token' | 'request' | string
 }
 
 export interface AvailableModel {
@@ -466,6 +538,7 @@ export interface UserSummary {
   last_model: string | null
   providers: string[]
   models: string[]
+  quota: UserQuotaStatus
 }
 
 export interface UserPayload {
@@ -473,6 +546,11 @@ export interface UserPayload {
   password?: string | undefined
   is_admin: boolean
   nickname: string
+}
+
+export interface UserQuotaPayload {
+  lifetime_quota_usd: number | null
+  monthly_quota_usd: number | null
 }
 
 export interface UserApiKeyBindPayload {

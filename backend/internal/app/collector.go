@@ -182,6 +182,9 @@ func (r *CollectorRunner) syncRemoteUsageEnabled(ctx context.Context, cfg AppCon
 	patch := collectorPatch{RemoteEnabledSet: true, RemoteEnabled: remoteEnabled}
 	if message != nil {
 		patch.LastError = message
+	} else if !cfg.Collector.Enabled {
+		emptyError := ""
+		patch.LastError = &emptyError
 	}
 	_ = r.updateState(ctx, patch)
 }

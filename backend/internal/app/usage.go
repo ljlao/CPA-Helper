@@ -1132,7 +1132,13 @@ func (a *App) saveUsageMessage(ctx context.Context, raw []byte) (UsageRecord, bo
 	}
 	id, _ := result.LastInsertId()
 	record, err := a.getUsageRecord(ctx, int(id))
-	return record, true, err
+	if err != nil {
+		return UsageRecord{}, false, err
+	}
+	if err := a.applyQuotaCharge(ctx, record); err != nil {
+		return UsageRecord{}, false, err
+	}
+	return record, true, nil
 }
 
 func (a *App) usageRecordByDedupe(ctx context.Context, dedupeKey string) (UsageRecord, error) {

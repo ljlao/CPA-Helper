@@ -34,6 +34,9 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	if !testColumnExists(t, app.db, "model_prices", "cache_creation_usd_per_million") {
 		t.Fatal("model_prices.cache_creation_usd_per_million was not created")
 	}
+	if !testColumnExists(t, app.db, "model_prices", "request_usd") {
+		t.Fatal("model_prices.request_usd was not created")
+	}
 	if testColumnExists(t, app.db, "model_prices", "cached_usd_per_million") {
 		t.Fatal("old model_prices.cached_usd_per_million should not exist")
 	}
@@ -46,13 +49,34 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	if !testColumnExists(t, app.db, "app_settings", "litellm_proxy_url") {
 		t.Fatal("app_settings.litellm_proxy_url was not created")
 	}
+	if !testColumnExists(t, app.db, "app_settings", "model_request_url") {
+		t.Fatal("app_settings.model_request_url was not created")
+	}
+	if !testColumnExists(t, app.db, "users", "quota_lifetime_usd") {
+		t.Fatal("users.quota_lifetime_usd was not created")
+	}
+	if testColumnExists(t, app.db, "users", "quota_total_usd") {
+		t.Fatal("old users.quota_total_usd should not exist")
+	}
+	if !testColumnExists(t, app.db, "users", "quota_monthly_usd") {
+		t.Fatal("users.quota_monthly_usd was not created")
+	}
+	if !testTableExists(t, app.db, "user_quota_charges") {
+		t.Fatal("user_quota_charges was not created")
+	}
+	if !testColumnExists(t, app.db, "user_quota_charges", "lifetime_deducted_usd") {
+		t.Fatal("user_quota_charges.lifetime_deducted_usd was not created")
+	}
+	if testColumnExists(t, app.db, "user_quota_charges", "total_deducted_usd") {
+		t.Fatal("old user_quota_charges.total_deducted_usd should not exist")
+	}
 
 	var version int64
 	if err := app.db.QueryRow(`SELECT MAX(version_id) FROM goose_db_version`).Scan(&version); err != nil {
 		t.Fatalf("query goose version: %v", err)
 	}
-	if version != 202605190002 {
-		t.Fatalf("goose version = %d, want 202605190002", version)
+	if version != 202605200004 {
+		t.Fatalf("goose version = %d, want 202605200004", version)
 	}
 }
 
@@ -223,6 +247,13 @@ func TestRunMigrationsRepairsOldPythonSchemaWithoutOldCode(t *testing.T) {
 	}
 	if cacheReadPrice != 0.5 || cacheCreationPrice != 0 {
 		t.Fatalf("migrated cache prices = read %v creation %v, want 0.5 and 0", cacheReadPrice, cacheCreationPrice)
+	}
+	var requestUSD sql.NullFloat64
+	if err := app.db.QueryRow(`SELECT request_usd FROM model_prices WHERE provider = 'openai' AND model = 'gpt-old-price'`).Scan(&requestUSD); err != nil {
+		t.Fatalf("migrated request price not found: %v", err)
+	}
+	if requestUSD.Valid {
+		t.Fatalf("migrated request_usd = %v, want NULL", requestUSD.Float64)
 	}
 }
 

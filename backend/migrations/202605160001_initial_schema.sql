@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS app_settings (
 	codex_keeper_priority_rules TEXT NOT NULL DEFAULT '{}',
 	litellm_proxy_enabled BOOLEAN NOT NULL DEFAULT 0,
 	litellm_proxy_url VARCHAR(1000) NOT NULL DEFAULT '',
+	model_request_url VARCHAR(1000) NOT NULL DEFAULT 'http://127.0.0.1:8317',
 	session_secret VARCHAR(200) NOT NULL,
 	created_at DATETIME NOT NULL,
 	updated_at DATETIME NOT NULL
@@ -72,6 +73,7 @@ CREATE TABLE IF NOT EXISTS model_prices (
 	output_usd_per_million REAL NOT NULL DEFAULT 0,
 	cache_read_usd_per_million REAL NOT NULL DEFAULT 0,
 	cache_creation_usd_per_million REAL NOT NULL DEFAULT 0,
+	request_usd REAL,
 	source VARCHAR(40) NOT NULL DEFAULT 'manual',
 	source_model VARCHAR(180),
 	auto_synced BOOLEAN NOT NULL DEFAULT 0,

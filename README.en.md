@@ -2,7 +2,7 @@
   <img src="frontend/public/logo.png" alt="CPA-Helper Logo" width="104" height="104" />
   <h1>CPA-Helper</h1>
   <p><strong>A local self-hosted multi-user admin panel for CLIProxyAPI</strong></p>
-  <p>Usage analytics · Request tracing · User role controls · API key management · Model pricing maintenance · Codex auth file inspection</p>
+  <p>Usage analytics · Request tracing · User balances · API key management · Model pricing maintenance · Codex auth file inspection</p>
   <p>
     <strong>English</strong>
     <span> · </span>
@@ -44,11 +44,12 @@ For clarity, model requests initiated by an Agent are still sent directly from t
 - **Usage analytics and cost estimation**: Track requests, tokens, success rate, latency, model distribution and estimated cost from global, per-user and current-account views.
 - **Request record tracing**: Admins can filter global request events by time, user, API key description, provider, model, endpoint and failure state; regular users inspect only their own account records.
 - **User and permission management**: Provide administrator and regular-user views; admins can create or disable regular accounts and manage nicknames, login accounts, passwords and roles.
-- **API key lifecycle management**: Each user can independently create, edit, copy and delete their own API keys and synchronize them to CPA, with usage counted and displayed per user.
-- **Model pricing maintenance**: Maintain input, output, cached and reasoning prices in USD per million tokens; historical costs are recalculated with current prices.
+- **User balances and automatic key pause**: Users are unlimited by default; admins can configure monthly balance and lifetime balance, usage is priced in USD with current model prices, monthly balance is consumed first, and exhausted users only have their CPA API keys paused.
+- **API key lifecycle management**: Each user can independently create, edit, copy and delete their own API keys and synchronize them to CPA, with usage counted per user and per-key request guidance plus live request testing.
+- **Model pricing maintenance**: Maintain token-model input, output and cache prices in USD per million tokens; models whose name contains `image` are charged by a fixed USD price per successful request, with CPA model comparison for quickly filling LiteLLM / manual prices.
 - **Available model aggregation**: Query available models through the current account's bound CPA API keys and enrich them with local pricing data.
 - **CLIProxyAPI / CPAMC integration**: Configure the service URL, management key, usage queue and local collector options to persist remote usage events into SQLite.
-- **Codex auth file inspection**: Support Cron scheduling, quota thresholds, check-only mode, concurrent workers, priority rules, account enable/disable and deletion.
+- **Codex auth file inspection**: Support Cron scheduling, quota thresholds, check-only mode, conditional scanning, concurrent workers, priority rules, account enable/disable and deletion.
 - **Local-first data storage**: Use SQLite and the `data/` directory by default, with `CPA_HELPER_DATA_DIR` available for overriding the runtime data path.
 - **Modern admin interface**: Built with Vue 3, Naive UI, ECharts and lucide icons, with light, dark and system theme modes.
 
@@ -70,19 +71,19 @@ Admins can filter global request events, while regular users can inspect records
 
 **User management**
 
-Admins can create or disable regular accounts, manage nicknames, roles and enabled status, and review per-user daily usage summaries.
+Admins can create or disable regular accounts, manage nicknames, roles and enabled status, and review per-user daily usage, monthly balance and lifetime balance.
 
 ![User management](pictures/用户管理.png)
 
 **Model pricing**
 
-Maintain model pricing and recalculate historical request costs using the latest configured prices.
+Compare CPA's currently available models with the local price catalog, quickly price missing models, and recalculate historical request costs using the latest configured prices.
 
 ![Model pricing](pictures/模型价格.png)
 
 **System settings**
 
-Configure the CLIProxyAPI / CPAMC endpoint, management key, local collector and polling options.
+Configure the CLIProxyAPI / CPAMC endpoint, model request URL, management key, local collector and polling options.
 
 ![System settings](pictures/系统设置.png)
 
@@ -90,7 +91,7 @@ Configure the CLIProxyAPI / CPAMC endpoint, management key, local collector and 
 
 **Inspection settings**
 
-Configure Codex auth file inspection with Cron schedules, quota thresholds, timeouts, retries, worker count and priority rules.
+Configure Codex auth file inspection with Cron schedules, quota thresholds, conditional scanning, timeouts, retries, worker count and priority rules.
 
 ![Inspection settings](pictures/巡检设置.png)
 
@@ -104,7 +105,7 @@ Review auth file health, quota windows, account types, priorities and the latest
 
 **My usage**
 
-Each user can review their own requests, tokens, costs, trends and model usage.
+Each user can review their own requests, tokens, costs, trends, model usage and current balance state.
 
 ![My usage](pictures/我的账户.png)
 
@@ -116,13 +117,13 @@ Each user can inspect request events and details scoped to their own account, se
 
 **API keys**
 
-Each account can independently create and manage its own API keys and review daily request, token and cost summaries.
+Each account can independently create and manage its own API keys, review daily request, token, cost and balance summaries, and generate examples or run a live test request for each key.
 
 ![API keys](pictures/API密钥.png)
 
 **Available models**
 
-Query available models through bound CPA API keys and display source keys with pricing information.
+Query available models through bound CPA API keys and display availability plus local pricing information.
 
 ![Available models](pictures/可用模型.png)
 
@@ -159,6 +160,7 @@ CPA-Helper/
 ├── pictures/                # README screenshots
 ├── docs/                    # Reference documentation
 ├── data/                    # Runtime data, ignored by Git by default
+├── VERSION                  # Shared app version for Docker tags and frontend display
 ├── README.md
 ├── README.en.md
 └── LICENSE
@@ -300,9 +302,29 @@ When `frontend/dist` exists, the backend serves the built single-page applicatio
 Use the System Settings page to configure:
 
 - **CLIProxyAPI / CPAMC URL**: defaults to `http://127.0.0.1:8317`.
+- **Model request URL**: used only by the API Keys page request-test dialog to generate the Base URL, endpoint URL and examples; it does not affect collection, the management key or backend synchronization.
 - **Management key**: used to access the CLIProxyAPI Management API.
 - **Enable local collector**: when enabled, CPA-Helper reads events from the usage queue and writes them to the local database.
 - **Batch size, polling interval and retry interval**: control local collector throughput and failure retry behavior.
+
+### User Balances
+
+- Existing users and newly created users are unlimited by default.
+- Admins can disable the unlimited toggle in User Management and then set monthly balance plus lifetime balance; both numeric fields default to `0` and cannot be left blank.
+- Initial balance setup does not retroactively charge historical usage; only newly collected usage after setup participates in balance deduction.
+- Balance consumption uses the USD amount estimated from current model prices. The fixed order is monthly balance first, then lifetime balance for any overflow.
+- When both balances are unavailable or exhausted, CPA-Helper removes that user's locally bound API keys from CPA, but it does not disable the login account. The user can still sign in and view the reason.
+- Monthly balance resets by the `Asia/Shanghai` calendar month. Entering a new month, adding balance or switching the user back to unlimited automatically restores keys that were paused only because of balance exhaustion.
+- Unpriced usage does not consume balance, but CPA-Helper records it as an unpriced balance event and surfaces the warning to admins and the affected user.
+
+### Model Pricing and Request Testing
+
+- The Model Pricing page shows CPA's currently available models alongside the local price catalog so missing prices are easy to find.
+- Token models store input, output, cache read and cache write prices as USD per million tokens. Models whose name contains `image` use a fixed USD price per successful request; if that per-request price is missing, the model is treated as unpriced.
+- Usage-history pages recalculate displayed costs with the current price catalog; already written balance charge records keep the amount calculated at the time and are not retroactively repriced.
+- LiteLLM sync can quickly fill the local price catalog while preserving manual prices. If GitHub is not reachable, configure the LiteLLM proxy from the Model Pricing page.
+- Each API key row includes Request Test, which shows the Base URL, endpoint URL, auth header and curl example, and can send one real test request.
+- Request testing supports Chat Completions, Responses and Claude Messages formats. The examples and test payload switch with the selected format.
 
 ### Data Directory
 
@@ -333,6 +355,7 @@ The Inspection Settings page manages Codex auth files:
 - Cron expressions define the automatic inspection schedule.
 - Quota thresholds decide when account priority should be degraded or restored.
 - Check-only mode records planned actions without disabling accounts or changing priorities.
+- Conditional scanning compares locally recorded accounts with the current CPA account list: accounts missing locally are queried once for quota and recorded, while accounts no longer present in CPA are removed locally.
 - Priority rules define default scheduling weights by account type.
 - The Account Status page shows health, quota, latest inspection, enabled state and manual priority.
 
@@ -364,6 +387,13 @@ Automated validation should not use a real CPA URL or real management key by
 default. For account inspection, enable/disable, priority changes, or deletion
 flows, use a fake CLIProxyAPI / CPAMC test double and prefer check-only mode;
 connect to real CPA only after the risk is explicitly accepted.
+
+### Version Management
+
+The project version is stored in the root `VERSION` file, for example `0.1.0`.
+GitHub Actions reads it to push `walkingd/cpa-helper:v0.1.0` and
+`walkingd/cpa-helper:latest`; the frontend build reads the same file and
+displays it as `v0.1.0`.
 
 Backend:
 

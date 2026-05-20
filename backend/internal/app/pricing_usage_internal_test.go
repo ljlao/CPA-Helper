@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -73,6 +74,106 @@ func TestRecordCostTruncatesGenericCachedTokens(t *testing.T) {
 	want := mathRound((100*1+10*20)/1_000_000.0, 8)
 	if amount != want {
 		t.Fatalf("cost = %v, want %v", amount, want)
+	}
+}
+
+func TestRecordCostUsesRequestPriceForImageModels(t *testing.T) {
+	provider := "openai"
+	model := "gpt-image-2"
+	requestUSD := 1.25
+	prices := map[[2]string]ModelPrice{
+		priceKey(provider, model): {
+			Provider:           provider,
+			Model:              model,
+			InputUSDPerMillion: 5,
+			RequestUSD:         &requestUSD,
+		},
+	}
+
+	amount, unpriced := recordCost(UsageRecord{
+		Provider:     &provider,
+		Model:        &model,
+		InputTokens:  1_000_000,
+		OutputTokens: 1_000_000,
+		TotalTokens:  2_000_000,
+	}, prices)
+	if unpriced || amount != 1.25 {
+		t.Fatalf("image cost = %v unpriced=%v, want 1.25 false", amount, unpriced)
+	}
+
+	amount, unpriced = recordCost(UsageRecord{
+		Provider: &provider,
+		Model:    &model,
+		Failed:   true,
+	}, prices)
+	if unpriced || amount != 0 {
+		t.Fatalf("failed image cost = %v unpriced=%v, want 0 false", amount, unpriced)
+	}
+}
+
+func TestRecordCostTreatsImageWithoutRequestPriceAsUnpriced(t *testing.T) {
+	provider := "openai"
+	model := "custom-image-model"
+	prices := map[[2]string]ModelPrice{
+		priceKey(provider, model): {
+			Provider:               provider,
+			Model:                  model,
+			InputUSDPerMillion:     100,
+			OutputUSDPerMillion:    100,
+			CacheReadUSDPerMillion: 100,
+		},
+	}
+
+	amount, unpriced := recordCost(UsageRecord{
+		Provider: &provider,
+		Model:    &model,
+	}, prices)
+	if amount != 0 || !unpriced {
+		t.Fatalf("image without request price cost = %v unpriced=%v, want 0 true", amount, unpriced)
+	}
+}
+
+func TestModelPriceAPIUpdatesImageRequestPrice(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+
+	var created ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPost, "/api/model-prices", map[string]any{
+		"provider":                       "openai",
+		"model":                          "gpt-image-2",
+		"input_usd_per_million":          0,
+		"output_usd_per_million":         0,
+		"cache_read_usd_per_million":     0,
+		"cache_creation_usd_per_million": 0,
+		"request_usd":                    1,
+	}, cookies, &created)
+	if created.RequestUSD == nil || *created.RequestUSD != 1 || created.BillingUnit != modelBillingUnitRequest {
+		t.Fatalf("created image price = %#v, want request_usd=1 request billing", created)
+	}
+
+	var updated ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPut, fmt.Sprintf("/api/model-prices/%d", created.ID), map[string]any{
+		"provider":                       "openai",
+		"model":                          "gpt-image-2",
+		"input_usd_per_million":          0,
+		"output_usd_per_million":         0,
+		"cache_read_usd_per_million":     0,
+		"cache_creation_usd_per_million": 0,
+		"request_usd":                    2.5,
+	}, cookies, &updated)
+	if updated.RequestUSD == nil || *updated.RequestUSD != 2.5 || updated.BillingUnit != modelBillingUnitRequest {
+		t.Fatalf("updated image price = %#v, want request_usd=2.5 request billing", updated)
 	}
 }
 
@@ -233,6 +334,159 @@ func TestListPricesOrdersManualBeforeSynced(t *testing.T) {
 	}
 	if !prices[1].AutoSynced || prices[1].Source != "litellm" || prices[1].Model != "aaa-model" {
 		t.Fatalf("second price = %#v, want synced price second", prices[1])
+	}
+}
+
+func TestModelPriceCatalogListsCPAModelsWithMatchedPrices(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	var seenAuth string
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		seenAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{
+				{"id": "gpt-priced", "name": "GPT Priced", "owner": "openai", "object": "model"},
+				{"id": "missing/model", "object": "model"},
+			},
+		})
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	cfg, err := app.loadConfig(context.Background())
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	if err := app.saveConfig(context.Background(), cfg); err != nil {
+		t.Fatalf("saveConfig failed: %v", err)
+	}
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+
+	now := dbTime(time.Now().In(appTimeLocation))
+	apiKey := "sk-catalog-test"
+	if _, err := app.db.Exec(`
+		INSERT INTO user_api_keys (api_key_hash, user_id, api_key, description, created_at, updated_at)
+		VALUES (?, 1, ?, 'Admin Key', ?, ?)
+	`, hashAPIKey(apiKey), apiKey, now, now); err != nil {
+		t.Fatalf("seed api key: %v", err)
+	}
+	if _, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			provider, model, input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million, source,
+			source_model, auto_synced, last_synced_at, updated_at
+		) VALUES ('openai', 'gpt-priced', 1, 2, 0.1, 0, 'litellm', 'gpt-priced', 1, ?, ?)
+	`, now, now); err != nil {
+		t.Fatalf("seed model price: %v", err)
+	}
+
+	var catalog ModelPriceCatalogResponse
+	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/catalog", nil, cookies, &catalog)
+	if seenAuth != "Bearer "+apiKey {
+		t.Fatalf("Authorization = %q, want bearer api key", seenAuth)
+	}
+	if catalog.APIKeyCount != 1 || catalog.QueryableAPIKeyCount != 1 {
+		t.Fatalf("key counts = %d/%d, want 1/1", catalog.APIKeyCount, catalog.QueryableAPIKeyCount)
+	}
+	if catalog.PricedModels != 1 || catalog.UnpricedModels != 1 {
+		t.Fatalf("priced/unpriced = %d/%d, want 1/1", catalog.PricedModels, catalog.UnpricedModels)
+	}
+	if len(catalog.Models) != 2 {
+		t.Fatalf("models length = %d, want 2", len(catalog.Models))
+	}
+	if catalog.Models[0].ID != "missing/model" || catalog.Models[0].Price != nil || catalog.Models[0].SuggestedProvider != "missing" {
+		t.Fatalf("first model = %#v, want missing/model unpriced with suggested provider", catalog.Models[0])
+	}
+	if catalog.Models[1].ID != "gpt-priced" || catalog.Models[1].Price == nil || catalog.Models[1].Price.Source != "litellm" {
+		t.Fatalf("second model = %#v, want gpt-priced with litellm price", catalog.Models[1])
+	}
+	if len(catalog.Models[1].Sources) != 1 || catalog.Models[1].Sources[0].Description != "Admin Key" || catalog.Models[1].Sources[0].UserLabel != "管理员" {
+		t.Fatalf("sources = %#v, want key description and user label", catalog.Models[1].Sources)
+	}
+}
+
+func TestModelPriceCatalogTreatsImageWithoutRequestPriceAsUnpriced(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{
+				{"id": "gpt-image-2", "name": "GPT Image", "owner": "openai", "object": "model"},
+			},
+		})
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	cfg, err := app.loadConfig(context.Background())
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	if err := app.saveConfig(context.Background(), cfg); err != nil {
+		t.Fatalf("saveConfig failed: %v", err)
+	}
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+
+	now := dbTime(time.Now().In(appTimeLocation))
+	apiKey := "sk-catalog-image-test"
+	if _, err := app.db.Exec(`
+		INSERT INTO user_api_keys (api_key_hash, user_id, api_key, description, created_at, updated_at)
+		VALUES (?, 1, ?, 'Admin Key', ?, ?)
+	`, hashAPIKey(apiKey), apiKey, now, now); err != nil {
+		t.Fatalf("seed api key: %v", err)
+	}
+	if _, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			provider, model, input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million, source,
+			source_model, auto_synced, last_synced_at, updated_at
+		) VALUES ('openai', 'gpt-image-2', 5, 10, 1.25, 0, 'litellm', 'gpt-image-2', 1, ?, ?)
+	`, now, now); err != nil {
+		t.Fatalf("seed model price: %v", err)
+	}
+
+	var catalog ModelPriceCatalogResponse
+	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/catalog", nil, cookies, &catalog)
+	if catalog.PricedModels != 0 || catalog.UnpricedModels != 1 {
+		t.Fatalf("priced/unpriced = %d/%d, want 0/1", catalog.PricedModels, catalog.UnpricedModels)
+	}
+	if len(catalog.Models) != 1 || catalog.Models[0].Price == nil {
+		t.Fatalf("catalog models = %#v, want matched unpriced image price", catalog.Models)
+	}
+	if catalog.Models[0].Price.BillingUnit != modelBillingUnitRequest || catalog.Models[0].Price.RequestUSD != nil {
+		t.Fatalf("image price = %#v, want request billing with nil request_usd", catalog.Models[0].Price)
 	}
 }
 

@@ -34,15 +34,24 @@ type apiKeyPayload struct {
 }
 
 type UserRecord struct {
-	ID           int
-	Username     string
-	IsAdmin      bool
-	Nickname     string
-	DisabledAt   *time.Time
-	PasswordHash *string
-	PasswordSalt *string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	ID                   int
+	Username             string
+	IsAdmin              bool
+	Nickname             string
+	DisabledAt           *time.Time
+	PasswordHash         *string
+	PasswordSalt         *string
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
+	QuotaLifetimeUSD     *float64
+	QuotaMonthlyUSD      *float64
+	QuotaStartedAt       *time.Time
+	QuotaMonth           string
+	QuotaMonthUsedUSD    float64
+	QuotaPausedAt        *time.Time
+	QuotaPauseReason     *string
+	QuotaSyncError       *string
+	QuotaUnpricedRecords int
 }
 
 type UserAPIKey struct {
@@ -85,36 +94,37 @@ type UserApiKeySummary struct {
 }
 
 type UserSummaryResponse struct {
-	ID                    int                 `json:"id"`
-	Username              string              `json:"username"`
-	IsAdmin               bool                `json:"is_admin"`
-	Nickname              string              `json:"nickname"`
-	DisabledAt            *time.Time          `json:"disabled_at"`
-	PasswordSet           bool                `json:"password_set"`
-	CreatedAt             time.Time           `json:"created_at"`
-	UpdatedAt             time.Time           `json:"updated_at"`
-	APIKeys               []UserApiKeySummary `json:"api_keys"`
-	KeyCount              int                 `json:"key_count"`
-	Records               int                 `json:"records"`
-	SuccessRecords        int                 `json:"success_records"`
-	FailedRecords         int                 `json:"failed_records"`
-	TotalTokens           int                 `json:"total_tokens"`
-	TodayRecords          int                 `json:"today_records"`
-	TodaySuccessRecords   int                 `json:"today_success_records"`
-	TodayFailedRecords    int                 `json:"today_failed_records"`
-	TodayInputTokens      int                 `json:"today_input_tokens"`
-	TodayOutputTokens     int                 `json:"today_output_tokens"`
-	TodayCachedTokens     int                 `json:"today_cached_tokens"`
-	TodayReasoningTokens  int                 `json:"today_reasoning_tokens"`
-	TodayTotalTokens      int                 `json:"today_total_tokens"`
-	TodayEstimatedCostUSD float64             `json:"today_estimated_cost_usd"`
-	TodayUnpricedRecords  int                 `json:"today_unpriced_records"`
-	FirstSeenAt           *time.Time          `json:"first_seen_at"`
-	LastSeenAt            *time.Time          `json:"last_seen_at"`
-	LastProvider          *string             `json:"last_provider"`
-	LastModel             *string             `json:"last_model"`
-	Providers             []string            `json:"providers"`
-	Models                []string            `json:"models"`
+	ID                    int                     `json:"id"`
+	Username              string                  `json:"username"`
+	IsAdmin               bool                    `json:"is_admin"`
+	Nickname              string                  `json:"nickname"`
+	DisabledAt            *time.Time              `json:"disabled_at"`
+	PasswordSet           bool                    `json:"password_set"`
+	CreatedAt             time.Time               `json:"created_at"`
+	UpdatedAt             time.Time               `json:"updated_at"`
+	APIKeys               []UserApiKeySummary     `json:"api_keys"`
+	KeyCount              int                     `json:"key_count"`
+	Records               int                     `json:"records"`
+	SuccessRecords        int                     `json:"success_records"`
+	FailedRecords         int                     `json:"failed_records"`
+	TotalTokens           int                     `json:"total_tokens"`
+	TodayRecords          int                     `json:"today_records"`
+	TodaySuccessRecords   int                     `json:"today_success_records"`
+	TodayFailedRecords    int                     `json:"today_failed_records"`
+	TodayInputTokens      int                     `json:"today_input_tokens"`
+	TodayOutputTokens     int                     `json:"today_output_tokens"`
+	TodayCachedTokens     int                     `json:"today_cached_tokens"`
+	TodayReasoningTokens  int                     `json:"today_reasoning_tokens"`
+	TodayTotalTokens      int                     `json:"today_total_tokens"`
+	TodayEstimatedCostUSD float64                 `json:"today_estimated_cost_usd"`
+	TodayUnpricedRecords  int                     `json:"today_unpriced_records"`
+	FirstSeenAt           *time.Time              `json:"first_seen_at"`
+	LastSeenAt            *time.Time              `json:"last_seen_at"`
+	LastProvider          *string                 `json:"last_provider"`
+	LastModel             *string                 `json:"last_model"`
+	Providers             []string                `json:"providers"`
+	Models                []string                `json:"models"`
+	Quota                 UserQuotaStatusResponse `json:"quota"`
 }
 
 func (a *App) handleUsers(w http.ResponseWriter, r *http.Request) error {
@@ -209,6 +219,21 @@ func (a *App) handleUserByPath(w http.ResponseWriter, r *http.Request) error {
 			return err
 		}
 		writeNoContent(w)
+		return nil
+	}
+	if len(parts) == 2 && parts[1] == "quota" {
+		if err := requireMethod(r, http.MethodPut); err != nil {
+			return err
+		}
+		var payload userQuotaPayload
+		if err := decodeJSON(r, &payload); err != nil {
+			return err
+		}
+		status, err := a.updateUserQuota(r.Context(), userID, payload)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, status)
 		return nil
 	}
 	if len(parts) == 2 && parts[1] == "api-keys" {
@@ -324,7 +349,11 @@ func (a *App) listUsers(ctx context.Context) ([]UserSummaryResponse, error) {
 	}
 	responses := make([]UserSummaryResponse, 0, len(users))
 	for _, user := range users {
-		responses = append(responses, userSummaryResponse(user, keysByUser[user.ID], usage[user.Username]))
+		quota, err := a.userQuotaStatus(ctx, user.ID)
+		if err != nil {
+			return nil, err
+		}
+		responses = append(responses, userSummaryResponse(user, keysByUser[user.ID], usage[user.Username], quota))
 	}
 	sort.Slice(responses, func(i, j int) bool { return responses[i].ID < responses[j].ID })
 	return responses, nil
@@ -362,7 +391,7 @@ func (a *App) createUser(ctx context.Context, payload userPayload) (UserSummaryR
 	if err != nil {
 		return UserSummaryResponse{}, err
 	}
-	return userSummaryResponse(user, nil, emptyUserUsageSummary()), nil
+	return userSummaryResponse(user, nil, emptyUserUsageSummary(), quotaStatusFromUser(user)), nil
 }
 
 func (a *App) updateUser(ctx context.Context, id int, payload userPayload) (UserSummaryResponse, error) {
@@ -441,6 +470,13 @@ func (a *App) enableUser(ctx context.Context, id int) error {
 	if user.DisabledAt == nil {
 		return nil
 	}
+	user, err = a.ensureQuotaMonth(ctx, user)
+	if err != nil {
+		return err
+	}
+	if user.QuotaPausedAt != nil && !quotaHasAvailable(user) {
+		return conflictError("用户额度已用尽，请补充额度后再恢复 API KEY")
+	}
 	keys, err := a.userAPIKeys(ctx, id)
 	if err != nil {
 		return err
@@ -463,13 +499,16 @@ func (a *App) enableUser(ctx context.Context, id int) error {
 		}
 		restored = append(restored, key.APIKeyHash)
 	}
-	_, err = a.db.ExecContext(ctx, `UPDATE users SET disabled_at = NULL, updated_at = ? WHERE id = ?`, dbTime(time.Now()), id)
+	_, err = a.db.ExecContext(ctx, `UPDATE users SET disabled_at = NULL, quota_paused_at = NULL, quota_pause_reason = NULL, quota_sync_error = NULL, updated_at = ? WHERE id = ?`, dbTime(time.Now()), id)
 	return err
 }
 
 func (a *App) bindUserAPIKey(ctx context.Context, userID int, payload userAPIKeyBindPayload) (UserApiKeySummary, error) {
 	user, err := a.getActiveUser(ctx, userID)
 	if err != nil {
+		return UserApiKeySummary{}, err
+	}
+	if err := a.ensureUserQuotaReadyForKeys(ctx, user.ID); err != nil {
 		return UserApiKeySummary{}, err
 	}
 	description := strings.TrimSpace(payload.Description)
@@ -550,6 +589,9 @@ func (a *App) createGeneratedAPIKeyForUser(ctx context.Context, userID int, user
 	}
 	user, err := a.getActiveUser(ctx, userID)
 	if err != nil {
+		return UserApiKeySummary{}, err
+	}
+	if err := a.ensureUserQuotaReadyForKeys(ctx, user.ID); err != nil {
 		return UserApiKeySummary{}, err
 	}
 	apiKey, err := a.generateUniqueAPIKey(ctx)
@@ -645,8 +687,13 @@ func (a *App) generateUniqueAPIKey(ctx context.Context) (string, error) {
 	return "", conflictError("生成 API KEY 失败，请重试")
 }
 
+const userSelectColumns = `id, username, is_admin, nickname, CAST(disabled_at AS TEXT), password_hash, password_salt,
+	CAST(created_at AS TEXT), CAST(updated_at AS TEXT), quota_lifetime_usd, quota_monthly_usd,
+	CAST(quota_started_at AS TEXT), quota_month, quota_month_used_usd, CAST(quota_paused_at AS TEXT),
+	quota_pause_reason, quota_sync_error, quota_unpriced_records`
+
 func (a *App) allUsers(ctx context.Context) ([]UserRecord, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT id, username, is_admin, nickname, CAST(disabled_at AS TEXT), password_hash, password_salt, CAST(created_at AS TEXT), CAST(updated_at AS TEXT) FROM users ORDER BY id`)
+	rows, err := a.db.QueryContext(ctx, `SELECT `+userSelectColumns+` FROM users ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -668,14 +715,33 @@ type userScanner interface {
 
 func scanUser(scanner userScanner) (UserRecord, error) {
 	var user UserRecord
-	var disabledAt, passwordHash, passwordSalt, createdAt, updatedAt sql.NullString
-	err := scanner.Scan(&user.ID, &user.Username, &user.IsAdmin, &user.Nickname, &disabledAt, &passwordHash, &passwordSalt, &createdAt, &updatedAt)
+	var disabledAt, passwordHash, passwordSalt, createdAt, updatedAt, quotaStartedAt, quotaPausedAt, quotaPauseReason, quotaSyncError sql.NullString
+	var quotaLifetime, quotaMonthly, quotaMonthUsed sql.NullFloat64
+	var quotaUnpriced sql.NullInt64
+	err := scanner.Scan(
+		&user.ID, &user.Username, &user.IsAdmin, &user.Nickname, &disabledAt,
+		&passwordHash, &passwordSalt, &createdAt, &updatedAt, &quotaLifetime,
+		&quotaMonthly, &quotaStartedAt, &user.QuotaMonth, &quotaMonthUsed,
+		&quotaPausedAt, &quotaPauseReason, &quotaSyncError, &quotaUnpriced,
+	)
 	if err != nil {
 		return UserRecord{}, err
 	}
 	user.DisabledAt = timePtr(disabledAt)
 	user.PasswordHash = nullableString(passwordHash)
 	user.PasswordSalt = nullableString(passwordSalt)
+	user.QuotaLifetimeUSD = nullableFloat(quotaLifetime)
+	user.QuotaMonthlyUSD = nullableFloat(quotaMonthly)
+	user.QuotaStartedAt = timePtr(quotaStartedAt)
+	if quotaMonthUsed.Valid {
+		user.QuotaMonthUsedUSD = quotaMonthUsed.Float64
+	}
+	user.QuotaPausedAt = timePtr(quotaPausedAt)
+	user.QuotaPauseReason = nullableString(quotaPauseReason)
+	user.QuotaSyncError = nullableString(quotaSyncError)
+	if quotaUnpriced.Valid {
+		user.QuotaUnpricedRecords = int(quotaUnpriced.Int64)
+	}
 	if parsed, ok := parseDBTime(createdAt.String); ok {
 		user.CreatedAt = parsed
 	}
@@ -686,7 +752,7 @@ func scanUser(scanner userScanner) (UserRecord, error) {
 }
 
 func (a *App) getUser(ctx context.Context, id int) (UserRecord, error) {
-	row := a.db.QueryRowContext(ctx, `SELECT id, username, is_admin, nickname, CAST(disabled_at AS TEXT), password_hash, password_salt, CAST(created_at AS TEXT), CAST(updated_at AS TEXT) FROM users WHERE id = ?`, id)
+	row := a.db.QueryRowContext(ctx, `SELECT `+userSelectColumns+` FROM users WHERE id = ?`, id)
 	user, err := scanUser(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -695,6 +761,11 @@ func (a *App) getUser(ctx context.Context, id int) (UserRecord, error) {
 		return UserRecord{}, err
 	}
 	return user, nil
+}
+
+func (a *App) userByUsername(ctx context.Context, username string) (UserRecord, error) {
+	row := a.db.QueryRowContext(ctx, `SELECT `+userSelectColumns+` FROM users WHERE username = ?`, username)
+	return scanUser(row)
 }
 
 func (a *App) getActiveUser(ctx context.Context, id int) (UserRecord, error) {
@@ -943,7 +1014,7 @@ func displayUserName(user UserRecord) string {
 	return "未知用户"
 }
 
-func userSummaryResponse(user UserRecord, keys []UserApiKeySummary, usage userUsageSummary) UserSummaryResponse {
+func userSummaryResponse(user UserRecord, keys []UserApiKeySummary, usage userUsageSummary, quota UserQuotaStatusResponse) UserSummaryResponse {
 	if usage.Providers == nil {
 		usage = emptyUserUsageSummary()
 	}
@@ -978,5 +1049,6 @@ func userSummaryResponse(user UserRecord, keys []UserApiKeySummary, usage userUs
 		LastModel:             usage.LastModel,
 		Providers:             usage.Providers,
 		Models:                usage.Models,
+		Quota:                 quota,
 	}
 }

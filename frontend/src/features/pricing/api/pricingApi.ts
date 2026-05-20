@@ -3,12 +3,17 @@ import type {
   LiteLLMProxySettings,
   LiteLLMProxySettingsPayload,
   ModelPrice,
+  ModelPriceCatalogResponse,
   ModelPricePayload,
   ModelPriceSyncResponse,
 } from '@/shared/types/api'
 
 export function listModelPrices(): Promise<ModelPrice[]> {
   return apiClient.get<ModelPrice[]>('/model-prices')
+}
+
+export function listModelPriceCatalog(): Promise<ModelPriceCatalogResponse> {
+  return apiClient.get<ModelPriceCatalogResponse>('/model-prices/catalog')
 }
 
 export function createModelPrice(payload: ModelPricePayload): Promise<ModelPrice> {

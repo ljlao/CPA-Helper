@@ -12,6 +12,7 @@ import {
 } from 'lucide-vue-next'
 
 import { getUsageOverview } from '@/features/usage/api/usageApi'
+import { getCurrentUserQuota } from '@/features/users/api/usersApi'
 import ChartPanel, { type ChartOption } from '@/features/usage/components/ChartPanel.vue'
 import type {
   DistributionItem,
@@ -23,6 +24,7 @@ import type {
   UsageOverviewResponse,
   UsageRankingsResponse,
   UsageSummary,
+  UserQuotaStatus,
 } from '@/shared/types/api'
 import {
   BEIJING_TIME_ZONE,
@@ -113,6 +115,7 @@ const auxiliaryError = ref<string | null>(null)
 const lastRefreshedAt = ref<Date | null>(null)
 const filtersExpanded = ref(false)
 const summary = ref<UsageSummary | null>(null)
+const quotaStatus = ref<UserQuotaStatus | null>(null)
 const realtimeSummary = ref<UsageSummary | null>(null)
 const todayTrends = ref<TrendPoint[]>([])
 const failedSummary = ref<UsageSummary | null>(null)
@@ -499,12 +502,15 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
             end: formatLocalDateTimeParam(realtimeEnd),
           })
         : Promise.resolve(null)
-    const [overviewResult, todayResult, failedResult, realtimeResult] = await Promise.allSettled([
-      getUsageOverview(filters),
-      getUsageOverview(todayFilters),
-      getUsageOverview(failedFilters),
-      realtimeRequest,
-    ] as const)
+    const quotaRequest = isAccountScope.value ? getCurrentUserQuota() : Promise.resolve(null)
+    const [overviewResult, todayResult, failedResult, realtimeResult, quotaResult] =
+      await Promise.allSettled([
+        getUsageOverview(filters),
+        getUsageOverview(todayFilters),
+        getUsageOverview(failedFilters),
+        realtimeRequest,
+        quotaRequest,
+      ] as const)
 
     if (overviewResult.status === 'rejected') {
       throw overviewResult.reason
@@ -548,10 +554,17 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
       realtimeSummary.value = null
     }
 
+    if (quotaResult.status === 'fulfilled') {
+      quotaStatus.value = quotaResult.value
+    } else if (isAccountScope.value) {
+      quotaStatus.value = null
+    }
+
     auxiliaryError.value =
       todayResult.status === 'rejected' ||
       failedResult.status === 'rejected' ||
-      realtimeResult.status === 'rejected'
+      realtimeResult.status === 'rejected' ||
+      quotaResult.status === 'rejected'
         ? '部分辅助指标加载失败'
         : null
 
@@ -710,6 +723,37 @@ const tokensPerMinute = computed(() => {
   const currentSummary = rateSummary.value
   return (currentSummary?.total_tokens ?? 0) / summaryDurationMinutes(currentSummary)
 })
+
+function quotaValueText(quota: UserQuotaStatus | null): string {
+  if (!quota) {
+    return '加载中'
+  }
+  if (quota.unlimited) {
+    return '每月余额 无限制'
+  }
+  return `每月余额 ${formatUsd(quota.monthly_remaining_usd ?? 0)}`
+}
+
+function quotaFootnote(quota: UserQuotaStatus | null): string {
+  if (!quota) {
+    return '额度加载中'
+  }
+  if (quota.unlimited) {
+    return '不限时余额 无限制'
+  }
+  const lifetimeText = `不限时余额 ${formatUsd(quota.lifetime_remaining_usd ?? 0)}`
+  const notes: string[] = []
+  if (quota.sync_error) {
+    notes.push('Key 同步异常')
+  }
+  if (quota.unpriced_records > 0) {
+    notes.push(`未定价 ${formatInteger(quota.unpriced_records)} 条`)
+  }
+  if (quota.paused) {
+    notes.push('Key 已因余额暂停')
+  }
+  return notes.length > 0 ? `${lifetimeText} · ${notes.join(' · ')}` : lifetimeText
+}
 
 const metricCards = computed<MetricCardConfig[]>(() => {
   const currentSummary = summary.value
@@ -1100,6 +1144,19 @@ onBeforeUnmount(() => {
         <p class="page-subtitle">{{ pageSubtitle }}</p>
       </div>
       <div class="header-actions">
+        <span
+          v-if="isAccountScope"
+          class="quota-status-pill"
+          :class="{
+            'is-paused': quotaStatus?.paused,
+            'is-warning': (quotaStatus?.unpriced_records ?? 0) > 0 || !!quotaStatus?.sync_error,
+          }"
+          :title="quotaFootnote(quotaStatus)"
+        >
+          <CircleDollarSign :size="14" :stroke-width="2.2" aria-hidden="true" />
+          <strong>{{ quotaValueText(quotaStatus) }}</strong>
+          <small>{{ quotaFootnote(quotaStatus) }}</small>
+        </span>
         <span class="refresh-status" :class="{ 'is-error': autoRefreshError }">
           {{ refreshStatusText }}
         </span>
@@ -1604,6 +1661,53 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: flex-end;
   gap: 12px;
+  min-width: 0;
+}
+
+.quota-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 420px;
+  min-width: 0;
+  padding: 5px 9px;
+  border: 1px solid color-mix(in srgb, var(--cpa-primary) 18%, var(--cpa-border));
+  border-radius: var(--cpa-radius-sm);
+  background: color-mix(in srgb, var(--cpa-primary-wash) 72%, var(--cpa-surface));
+  color: var(--cpa-primary);
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.quota-status-pill strong,
+.quota-status-pill small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.quota-status-pill strong {
+  color: var(--cpa-text-strong);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.quota-status-pill small {
+  color: var(--cpa-text-strong);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.quota-status-pill.is-warning {
+  border-color: color-mix(in srgb, var(--cpa-warning) 24%, var(--cpa-border));
+  background: color-mix(in srgb, var(--cpa-warning-weak) 68%, var(--cpa-surface));
+  color: var(--cpa-warning);
+}
+
+.quota-status-pill.is-paused {
+  border-color: color-mix(in srgb, var(--cpa-danger) 24%, var(--cpa-border));
+  background: color-mix(in srgb, var(--cpa-danger-weak) 68%, var(--cpa-surface));
+  color: var(--cpa-danger);
 }
 
 .refresh-status {
@@ -2464,6 +2568,10 @@ onBeforeUnmount(() => {
     width: 100%;
     align-items: flex-start;
     justify-content: space-between;
+  }
+
+  .quota-status-pill {
+    max-width: 100%;
   }
 
   .refresh-status {

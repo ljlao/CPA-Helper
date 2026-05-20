@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -28,6 +29,13 @@ type changeCredentialsRequest struct {
 }
 
 var apiKeySyncTimeout = 8 * time.Second
+var modelRequestTestTimeout = 45 * time.Second
+
+const (
+	modelRequestEndpointChatCompletions = "chat_completions"
+	modelRequestEndpointResponses       = "responses"
+	modelRequestEndpointClaudeMessages  = "claude_messages"
+)
 
 const apiKeySyncMissingConfigMessage = "CPA 配置未完成：请先到「系统设置」填写 CLIProxyAPI 地址和管理密钥，再返回 API 密钥页操作。"
 
@@ -250,12 +258,29 @@ func (a *App) userCredentialsByUsername(ctx context.Context, username string) (A
 
 type settingsUpdateRequest struct {
 	CLIProxyURL          *string  `json:"cliaproxy_url"`
+	ModelRequestURL      *string  `json:"model_request_url"`
 	ManagementKey        *string  `json:"management_key"`
 	CollectorEnabled     *bool    `json:"collector_enabled"`
 	QueueName            *string  `json:"queue_name"`
 	BatchSize            *int     `json:"batch_size"`
 	PollIntervalSeconds  *float64 `json:"poll_interval_seconds"`
 	RetryIntervalSeconds *float64 `json:"retry_interval_seconds"`
+}
+
+type modelRequestTestPayload struct {
+	APIKeyHash string `json:"api_key_hash"`
+	Endpoint   string `json:"endpoint"`
+	Model      string `json:"model"`
+	Message    string `json:"message"`
+}
+
+type modelRequestTestResponse struct {
+	Endpoint   string         `json:"endpoint"`
+	Model      string         `json:"model"`
+	Reply      string         `json:"reply"`
+	StatusCode int            `json:"status_code"`
+	DurationMS int64          `json:"duration_ms"`
+	Usage      map[string]any `json:"usage,omitempty"`
 }
 
 func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) error {
@@ -285,6 +310,13 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) error {
 				return validationError("不能为空")
 			}
 			cfg.Collector.CLIProxyURL = value
+		}
+		if payload.ModelRequestURL != nil {
+			value, err := normalizeModelRequestURL(*payload.ModelRequestURL)
+			if err != nil {
+				return err
+			}
+			cfg.ModelRequestURL = value
 		}
 		if payload.ManagementKey != nil {
 			cfg.Collector.ManagementKey = strings.TrimSpace(*payload.ManagementKey)
@@ -331,6 +363,7 @@ func settingsResponse(cfg AppConfig) map[string]any {
 	collector := cfg.Collector
 	return map[string]any{
 		"cliaproxy_url":          collector.CLIProxyURL,
+		"model_request_url":      cfg.ModelRequestURL,
 		"management_key":         collector.ManagementKey,
 		"management_key_set":     strings.TrimSpace(collector.ManagementKey) != "",
 		"collector_enabled":      collector.Enabled,
@@ -339,6 +372,327 @@ func settingsResponse(cfg AppConfig) map[string]any {
 		"poll_interval_seconds":  collector.PollIntervalSeconds,
 		"retry_interval_seconds": collector.RetryIntervalSeconds,
 	}
+}
+
+func (a *App) handleCurrentModelRequestGuide(w http.ResponseWriter, r *http.Request) error {
+	if err := requireMethod(r, http.MethodGet); err != nil {
+		return err
+	}
+	if _, err := a.currentUser(r.Context(), r); err != nil {
+		return err
+	}
+	cfg, err := a.loadConfig(r.Context())
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, modelRequestGuideResponse(cfg.ModelRequestURL))
+	return nil
+}
+
+func (a *App) handleCurrentModelRequestTest(w http.ResponseWriter, r *http.Request) error {
+	if err := requireMethod(r, http.MethodPost); err != nil {
+		return err
+	}
+	user, err := a.readyUser(r.Context(), r)
+	if err != nil {
+		return err
+	}
+	var payload modelRequestTestPayload
+	if err := decodeJSON(r, &payload); err != nil {
+		return err
+	}
+	response, err := a.testCurrentUserModelRequest(r.Context(), user, payload)
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, response)
+	return nil
+}
+
+func (a *App) testCurrentUserModelRequest(ctx context.Context, user *AuthUser, payload modelRequestTestPayload) (modelRequestTestResponse, error) {
+	apiKeyHash := strings.TrimSpace(payload.APIKeyHash)
+	model := strings.TrimSpace(payload.Model)
+	message := strings.TrimSpace(payload.Message)
+	if apiKeyHash == "" {
+		return modelRequestTestResponse{}, validationError("API KEY 不能为空")
+	}
+	if model == "" {
+		return modelRequestTestResponse{}, validationError("测试模型不能为空")
+	}
+	if len(model) > 256 {
+		return modelRequestTestResponse{}, validationError("测试模型名称过长")
+	}
+	if message == "" {
+		message = "请用一句中文回复：连接测试成功。"
+	}
+	if len(message) > 4000 {
+		return modelRequestTestResponse{}, validationError("测试消息不能超过 4000 个字符")
+	}
+	endpoint, err := normalizeModelRequestEndpoint(payload.Endpoint)
+	if err != nil {
+		return modelRequestTestResponse{}, err
+	}
+
+	apiKey, err := a.getAPIKey(ctx, apiKeyHash)
+	if err != nil {
+		return modelRequestTestResponse{}, err
+	}
+	if apiKey.UserID != user.ID {
+		return modelRequestTestResponse{}, notFoundError("API KEY 不存在")
+	}
+	if apiKey.APIKey == nil || strings.TrimSpace(*apiKey.APIKey) == "" {
+		return modelRequestTestResponse{}, conflictError("当前 API KEY 缺少完整密钥，无法发起测试")
+	}
+	cfg, err := a.loadConfig(ctx)
+	if err != nil {
+		return modelRequestTestResponse{}, err
+	}
+	target := strings.TrimRight(modelRequestOpenAIBaseURL(cfg.ModelRequestURL), "/") + modelRequestEndpointPath(endpoint)
+	headers := modelRequestEndpointHeaders(endpoint, strings.TrimSpace(*apiKey.APIKey))
+	requestBody := modelRequestEndpointBody(endpoint, model, message)
+
+	start := time.Now()
+	response, responseBody, err := doJSON(ctx, httpClient(modelRequestTestTimeout), http.MethodPost, target, headers, requestBody)
+	durationMS := time.Since(start).Milliseconds()
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return modelRequestTestResponse{}, validationError("模型请求超时，请检查模型请求地址或稍后重试")
+		}
+		return modelRequestTestResponse{}, validationError("模型请求失败：" + err.Error())
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		detail := compactRemoteResponse(responseBody)
+		if detail != "" {
+			return modelRequestTestResponse{}, validationError(fmt.Sprintf("模型请求失败：HTTP %d：%s", response.StatusCode, detail))
+		}
+		return modelRequestTestResponse{}, validationError(fmt.Sprintf("模型请求失败：HTTP %d", response.StatusCode))
+	}
+	reply, usage, err := parseModelRequestTestResponse(endpoint, responseBody)
+	if err != nil {
+		return modelRequestTestResponse{}, err
+	}
+	return modelRequestTestResponse{
+		Endpoint:   endpoint,
+		Model:      model,
+		Reply:      reply,
+		StatusCode: response.StatusCode,
+		DurationMS: durationMS,
+		Usage:      usage,
+	}, nil
+}
+
+func parseModelRequestTestResponse(endpoint string, payload []byte) (string, map[string]any, error) {
+	var raw map[string]any
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return "", nil, validationError("模型响应不是有效 JSON")
+	}
+	var usage map[string]any
+	if value, ok := raw["usage"].(map[string]any); ok {
+		usage = value
+	}
+	var reply string
+	switch endpoint {
+	case modelRequestEndpointResponses:
+		reply = extractResponsesReply(raw)
+	case modelRequestEndpointClaudeMessages:
+		reply = extractClaudeMessagesReply(raw)
+	default:
+		reply = extractChatCompletionReply(raw)
+	}
+	return reply, usage, nil
+}
+
+func normalizeModelRequestEndpoint(value string) (string, error) {
+	switch strings.TrimSpace(value) {
+	case "", modelRequestEndpointChatCompletions:
+		return modelRequestEndpointChatCompletions, nil
+	case modelRequestEndpointResponses:
+		return modelRequestEndpointResponses, nil
+	case modelRequestEndpointClaudeMessages:
+		return modelRequestEndpointClaudeMessages, nil
+	default:
+		return "", validationError("请求格式不支持")
+	}
+}
+
+func modelRequestEndpointPath(endpoint string) string {
+	switch endpoint {
+	case modelRequestEndpointResponses:
+		return "/responses"
+	case modelRequestEndpointClaudeMessages:
+		return "/messages"
+	default:
+		return "/chat/completions"
+	}
+}
+
+func modelRequestEndpointHeaders(endpoint string, apiKey string) http.Header {
+	headers := http.Header{}
+	if endpoint == modelRequestEndpointClaudeMessages {
+		headers.Set("x-api-key", apiKey)
+		headers.Set("anthropic-version", "2023-06-01")
+		return headers
+	}
+	headers.Set("Authorization", "Bearer "+apiKey)
+	return headers
+}
+
+func modelRequestEndpointBody(endpoint string, model string, message string) map[string]any {
+	switch endpoint {
+	case modelRequestEndpointResponses:
+		return map[string]any{
+			"model":  model,
+			"input":  message,
+			"stream": false,
+		}
+	case modelRequestEndpointClaudeMessages:
+		return map[string]any{
+			"model":      model,
+			"max_tokens": 1024,
+			"messages": []map[string]string{
+				{"role": "user", "content": message},
+			},
+		}
+	default:
+		return map[string]any{
+			"model": model,
+			"messages": []map[string]string{
+				{"role": "user", "content": message},
+			},
+			"stream": false,
+		}
+	}
+}
+
+func extractChatCompletionReply(raw map[string]any) string {
+	choices, ok := raw["choices"].([]any)
+	if !ok || len(choices) == 0 {
+		return ""
+	}
+	for _, item := range choices {
+		choice, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if message, ok := choice["message"].(map[string]any); ok {
+			if content := chatContentText(message["content"]); content != "" {
+				return content
+			}
+		}
+		if text := stringValue(choice["text"]); text != nil {
+			return *text
+		}
+	}
+	return ""
+}
+
+func extractResponsesReply(raw map[string]any) string {
+	if text := stringValue(raw["output_text"]); text != nil {
+		return *text
+	}
+	output, ok := raw["output"].([]any)
+	if !ok {
+		return ""
+	}
+	var parts []string
+	for _, item := range output {
+		object, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if content := chatContentText(object["content"]); content != "" {
+			parts = append(parts, content)
+		}
+		if text := stringValue(object["text"]); text != nil {
+			parts = append(parts, *text)
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func extractClaudeMessagesReply(raw map[string]any) string {
+	if content := chatContentText(raw["content"]); content != "" {
+		return content
+	}
+	if text := stringValue(raw["completion"]); text != nil {
+		return *text
+	}
+	return ""
+}
+
+func chatContentText(value any) string {
+	if text := stringValue(value); text != nil {
+		return *text
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return ""
+	}
+	var parts []string
+	for _, item := range items {
+		object, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if text := stringValue(object["text"]); text != nil {
+			parts = append(parts, *text)
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func compactRemoteResponse(payload []byte) string {
+	text := strings.TrimSpace(string(payload))
+	if text == "" {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) > 800 {
+		text = string(runes[:800]) + "..."
+	}
+	return text
+}
+
+func normalizeModelRequestURL(value string) (string, error) {
+	normalized := strings.TrimRight(strings.TrimSpace(value), "/")
+	if normalized == "" {
+		return "", validationError("模型请求地址不能为空")
+	}
+	parsed, err := url.Parse(normalized)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", validationError("模型请求地址必须是有效的 http:// 或 https:// 地址")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", validationError("模型请求地址必须使用 http:// 或 https://")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", validationError("模型请求地址不能包含查询参数或锚点")
+	}
+	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+func modelRequestGuideResponse(modelRequestURL string) map[string]any {
+	requestURL := strings.TrimRight(strings.TrimSpace(modelRequestURL), "/")
+	if requestURL == "" {
+		requestURL = defaultCPAURL
+	}
+	openAIBaseURL := modelRequestOpenAIBaseURL(requestURL)
+	return map[string]any{
+		"model_request_url":    requestURL,
+		"openai_base_url":      openAIBaseURL,
+		"chat_completions_url": strings.TrimRight(openAIBaseURL, "/") + "/chat/completions",
+	}
+}
+
+func modelRequestOpenAIBaseURL(requestURL string) string {
+	normalized := strings.TrimRight(strings.TrimSpace(requestURL), "/")
+	if normalized == "" {
+		normalized = defaultCPAURL
+	}
+	if strings.HasSuffix(strings.ToLower(normalized), "/v1") {
+		return normalized
+	}
+	return normalized + "/v1"
 }
 
 func (a *App) handleCollectorStatus(w http.ResponseWriter, r *http.Request) error {

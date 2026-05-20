@@ -2,6 +2,7 @@
 import type { Component, CSSProperties } from 'vue'
 import { computed, h, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
+  NAlert,
   NButton,
   NDataTable,
   NForm,
@@ -24,17 +25,48 @@ import {
   createModelPrice,
   deleteModelPrice,
   getLiteLLMProxySettings,
+  listModelPriceCatalog,
   listModelPrices,
   syncLitellmModelPrices,
   updateLiteLLMProxySettings,
   updateModelPrice,
 } from '@/features/pricing/api/pricingApi'
-import type { LiteLLMProxySettingsPayload, ModelPrice, ModelPricePayload } from '@/shared/types/api'
+import type {
+  LiteLLMProxySettingsPayload,
+  ModelPrice,
+  ModelPriceCatalogResponse,
+  ModelPricePayload,
+} from '@/shared/types/api'
 import { formatDateTime, formatInteger } from '@/shared/utils/format'
 
 type PriceTableLayoutProps =
   | { flexHeight: true }
   | { flexHeight: false; maxHeight: string }
+
+type PriceRowStatus = 'missing' | 'litellm' | 'manual'
+type PriceStatusFilter = 'cpa' | 'missing' | 'litellm' | 'manual' | 'library'
+type BillingUnit = 'token' | 'request'
+type PriceFieldName = keyof Pick<
+  ModelPrice,
+  | 'input_usd_per_million'
+  | 'output_usd_per_million'
+  | 'cache_read_usd_per_million'
+  | 'cache_creation_usd_per_million'
+>
+
+interface PriceDisplayRow {
+  key: string
+  in_cpa: boolean
+  id: string
+  name: string
+  owner: string | null
+  suggested_provider: string
+  price: ModelPrice | null
+  provider: string
+  model: string
+  billing_unit: BillingUnit
+  status: PriceRowStatus
+}
 
 const PRICE_TABLE_FALLBACK_MAX_HEIGHT = 'max(240px, calc(100dvh - 360px))'
 const priceModalStyle: CSSProperties = { width: 'min(640px, calc(100vw - 32px))' }
@@ -54,7 +86,9 @@ const isProxyLoading = ref(false)
 const isProxySaving = ref(false)
 const editingId = ref<number | null>(null)
 const prices = ref<ModelPrice[]>([])
+const catalog = ref<ModelPriceCatalogResponse | null>(null)
 const selectedProvider = ref<string | null>(null)
+const selectedStatus = ref<PriceStatusFilter | null>(null)
 const searchQuery = ref('')
 const isDesktopPriceLayout = ref(desktopPriceLayoutQuery.matches)
 const pagination = reactive({
@@ -69,28 +103,84 @@ const form = reactive<ModelPricePayload>({
   output_usd_per_million: 0,
   cache_read_usd_per_million: 0,
   cache_creation_usd_per_million: 0,
+  request_usd: null,
 })
 const proxyForm = reactive<LiteLLMProxySettingsPayload>({
   enabled: false,
   proxy_url: '',
 })
 
+const priceRows = computed<PriceDisplayRow[]>(() => {
+  const rows: PriceDisplayRow[] = []
+  const catalogPriceIds = new Set<number>()
+  for (const model of catalog.value?.models ?? []) {
+    if (model.price) {
+      catalogPriceIds.add(model.price.id)
+    }
+    const provider = model.price?.provider || model.suggested_provider || model.owner || providerFromModelId(model.id)
+    const billingUnit = billingUnitForPrice(model.price, model.id)
+    rows.push({
+      key: `catalog:${model.id}`,
+      in_cpa: true,
+      id: model.id,
+      name: model.name || model.id,
+      owner: model.owner,
+      suggested_provider: model.suggested_provider,
+      price: model.price,
+      provider,
+      model: model.price?.model || model.id,
+      billing_unit: billingUnit,
+      status: model.price ? priceStatus(model.price, model.id) : 'missing',
+    })
+  }
+  for (const price of prices.value) {
+    if (catalogPriceIds.has(price.id)) {
+      continue
+    }
+    rows.push({
+      key: `price:${price.id}`,
+      in_cpa: false,
+      id: price.model,
+      name: price.model,
+      owner: null,
+      suggested_provider: '',
+      price,
+      provider: price.provider,
+      model: price.model,
+      billing_unit: billingUnitForPrice(price, price.model),
+      status: priceStatus(price, price.model),
+    })
+  }
+  return rows
+})
+
 const providerOptions = computed(() =>
-  [...new Set(prices.value.map((price) => price.provider))]
+  [...new Set(priceRows.value.map((row) => row.provider).filter(Boolean))]
     .sort((a, b) => a.localeCompare(b))
     .map((provider) => ({ label: provider, value: provider })),
 )
 
+const statusOptions: Array<{ label: string; value: PriceStatusFilter }> = [
+  { label: 'CPA 可用模型', value: 'cpa' },
+  { label: '未定价', value: 'missing' },
+  { label: 'LiteLLM', value: 'litellm' },
+  { label: '手动', value: 'manual' },
+  { label: '仅有价格', value: 'library' },
+]
+
 const filteredPrices = computed(() => {
-  return prices.value.filter((price) => {
-    if (selectedProvider.value && price.provider !== selectedProvider.value) {
+  return priceRows.value.filter((row) => {
+    if (selectedProvider.value && row.provider !== selectedProvider.value) {
       return false
     }
-    return priceMatchesSearch(price)
+    if (selectedStatus.value && !rowMatchesStatus(row, selectedStatus.value)) {
+      return false
+    }
+    return priceMatchesSearch(row)
   })
 })
 
-watch([selectedProvider, searchQuery], () => {
+watch([selectedProvider, selectedStatus, searchQuery], () => {
   pagination.page = 1
 })
 
@@ -106,17 +196,88 @@ function normalizePriceSearch(value: string) {
   return value.trim().toLowerCase()
 }
 
+function providerFromModelId(modelId: string) {
+  const separator = modelId.indexOf('/')
+  return separator > 0 ? modelId.slice(0, separator) : ''
+}
+
+function billingUnitForModel(model: string): BillingUnit {
+  return model.trim().toLowerCase().includes('image') ? 'request' : 'token'
+}
+
+function billingUnitForPrice(price: ModelPrice | null, fallbackModel: string): BillingUnit {
+  if (price?.billing_unit === 'request') {
+    return 'request'
+  }
+  if (price?.billing_unit === 'token') {
+    return 'token'
+  }
+  return billingUnitForModel(price?.model || fallbackModel)
+}
+
+function priceReadyForBilling(price: ModelPrice, fallbackModel: string): boolean {
+  return billingUnitForPrice(price, fallbackModel) === 'request' ? typeof price.request_usd === 'number' : true
+}
+
+function priceStatus(price: ModelPrice, fallbackModel: string): PriceRowStatus {
+  if (!priceReadyForBilling(price, fallbackModel)) {
+    return 'missing'
+  }
+  return price.auto_synced ? 'litellm' : 'manual'
+}
+
+function rowMatchesStatus(row: PriceDisplayRow, status: PriceStatusFilter) {
+  switch (status) {
+    case 'cpa':
+      return row.in_cpa
+    case 'library':
+      return !row.in_cpa
+    default:
+      return row.status === status
+  }
+}
+
 const normalizedSearchQuery = computed(() => normalizePriceSearch(searchQuery.value))
 
 const filteredPriceCount = computed(() => filteredPrices.value.length)
 
-const totalPriceCount = computed(() => prices.value.length)
+const totalPriceCount = computed(() => priceRows.value.length)
+const cpaModelCount = computed(() => catalog.value?.models.length ?? 0)
+const unpricedModelCount = computed(
+  () => catalog.value?.unpriced_models ?? priceRows.value.filter((row) => row.in_cpa && row.status === 'missing').length,
+)
 const syncedPriceCount = computed(() => prices.value.filter((price) => price.auto_synced).length)
 const manualPriceCount = computed(() => prices.value.filter((price) => !price.auto_synced).length)
+const catalogNotice = computed(() => {
+  const current = catalog.value
+  if (!current) {
+    return ''
+  }
+  if (!current.has_api_keys) {
+    return '还没有本地绑定的 API Key，当前只显示已有价格库条目。'
+  }
+  if (current.queryable_api_key_count === 0) {
+    return '本地 API Key 没有保存明文 Key，暂时无法查询 CPA 当前模型，只显示已有价格库条目。'
+  }
+  if (current.errors.length > 0) {
+    const details = current.errors
+      .slice(0, 3)
+      .map((item) => `${item.description}：${item.message}`)
+      .join('；')
+    return `部分 Key 查询 CPA 模型失败：${details}`
+  }
+  return ''
+})
 const priceTableLayoutProps = computed<PriceTableLayoutProps>(() =>
   isDesktopPriceLayout.value
     ? { flexHeight: true }
     : { flexHeight: false, maxHeight: PRICE_TABLE_FALLBACK_MAX_HEIGHT },
+)
+const isRequestPriceForm = computed(() => billingUnitForModel(form.model) === 'request')
+const priceSaveHint = computed(() =>
+  isRequestPriceForm.value
+    ? 'image 模型按每次成功调用固定金额计费，保存后会作为手动价格优先保留。'
+    : '保存后会作为手动价格，后续 LiteLLM 同步会优先保留。',
 )
 
 interface PriceMetricCard {
@@ -131,17 +292,19 @@ interface PriceMetricCard {
 const priceMetrics = computed<PriceMetricCard[]>(() => [
   {
     key: 'models',
-    label: '价格条目',
-    value: formatInteger(totalPriceCount.value),
-    footnote: `筛选后 ${formatInteger(filteredPriceCount.value)}`,
+    label: 'CPA 模型',
+    value: formatInteger(cpaModelCount.value),
+    footnote: catalog.value
+      ? `可查询 Key ${formatInteger(catalog.value.queryable_api_key_count)} / ${formatInteger(catalog.value.api_key_count)}`
+      : '等待刷新',
     tone: 'teal',
     icon: Layers3,
   },
   {
-    key: 'providers',
-    label: '服务商',
-    value: formatInteger(providerOptions.value.length),
-    footnote: '当前价格库',
+    key: 'unpriced',
+    label: '未定价',
+    value: formatInteger(unpricedModelCount.value),
+    footnote: `筛选后 ${formatInteger(filteredPriceCount.value)} / ${formatInteger(totalPriceCount.value)}`,
     tone: 'blue',
     icon: Server,
   },
@@ -163,13 +326,17 @@ const priceMetrics = computed<PriceMetricCard[]>(() => [
   },
 ])
 
-function priceMatchesSearch(price: ModelPrice) {
+function priceMatchesSearch(row: PriceDisplayRow) {
   if (!normalizedSearchQuery.value) {
     return true
   }
   return (
-    price.provider.toLowerCase().includes(normalizedSearchQuery.value) ||
-    price.model.toLowerCase().includes(normalizedSearchQuery.value)
+    row.provider.toLowerCase().includes(normalizedSearchQuery.value) ||
+    row.model.toLowerCase().includes(normalizedSearchQuery.value) ||
+    row.id.toLowerCase().includes(normalizedSearchQuery.value) ||
+    row.name.toLowerCase().includes(normalizedSearchQuery.value) ||
+    (row.owner ?? '').toLowerCase().includes(normalizedSearchQuery.value) ||
+    row.suggested_provider.toLowerCase().includes(normalizedSearchQuery.value)
   )
 }
 
@@ -181,12 +348,15 @@ function resetForm() {
   form.output_usd_per_million = 0
   form.cache_read_usd_per_million = 0
   form.cache_creation_usd_per_million = 0
+  form.request_usd = null
 }
 
 async function refresh() {
   isLoading.value = true
   try {
-    prices.value = await listModelPrices()
+    const [nextPrices, nextCatalog] = await Promise.all([listModelPrices(), listModelPriceCatalog()])
+    prices.value = nextPrices
+    catalog.value = nextCatalog
   } catch (error) {
     message.error(error instanceof Error ? error.message : '加载模型价格失败')
   } finally {
@@ -194,9 +364,23 @@ async function refresh() {
   }
 }
 
-function openCreate() {
+function openCreate(prefill: Partial<ModelPricePayload> = {}) {
   resetForm()
+  form.provider = prefill.provider ?? ''
+  form.model = prefill.model ?? ''
+  form.input_usd_per_million = prefill.input_usd_per_million ?? 0
+  form.output_usd_per_million = prefill.output_usd_per_million ?? 0
+  form.cache_read_usd_per_million = prefill.cache_read_usd_per_million ?? 0
+  form.cache_creation_usd_per_million = prefill.cache_creation_usd_per_million ?? 0
+  form.request_usd = prefill.request_usd ?? null
   modalOpen.value = true
+}
+
+function openCreateForRow(row: PriceDisplayRow) {
+  openCreate({
+    provider: row.provider || row.suggested_provider || row.owner || '',
+    model: row.id,
+  })
 }
 
 function openEdit(row: ModelPrice) {
@@ -207,10 +391,13 @@ function openEdit(row: ModelPrice) {
   form.output_usd_per_million = row.output_usd_per_million
   form.cache_read_usd_per_million = row.cache_read_usd_per_million
   form.cache_creation_usd_per_million = row.cache_creation_usd_per_million
+  form.request_usd = row.request_usd
   modalOpen.value = true
 }
 
 async function savePrice() {
+  const requestPriceMode = isRequestPriceForm.value
+  const requestUSD = requestPriceMode && typeof form.request_usd === 'number' ? form.request_usd : null
   const payload: ModelPricePayload = {
     provider: form.provider.trim(),
     model: form.model.trim(),
@@ -218,9 +405,14 @@ async function savePrice() {
     output_usd_per_million: form.output_usd_per_million,
     cache_read_usd_per_million: form.cache_read_usd_per_million,
     cache_creation_usd_per_million: form.cache_creation_usd_per_million,
+    request_usd: requestUSD,
   }
   if (!payload.provider || !payload.model) {
     message.error('服务商和模型不能为空')
+    return
+  }
+  if (requestPriceMode && requestUSD === null) {
+    message.error('image 模型需要填写每次调用价格')
     return
   }
   try {
@@ -309,34 +501,159 @@ function handleDesktopPriceLayoutChange(event: MediaQueryListEvent) {
   isDesktopPriceLayout.value = event.matches
 }
 
-const columns: DataTableColumns<ModelPrice> = [
-  { title: '服务商', key: 'provider', width: 150, ellipsis: { tooltip: true } },
-  { title: '模型', key: 'model', width: 360, ellipsis: { tooltip: true } },
-  { title: '输入 ($/MTok)', key: 'input_usd_per_million', width: 125 },
-  { title: '输出 ($/MTok)', key: 'output_usd_per_million', width: 125 },
-  { title: '缓存读 ($/MTok)', key: 'cache_read_usd_per_million', width: 125 },
-  { title: '缓存写 ($/MTok)', key: 'cache_creation_usd_per_million', width: 125 },
+function rowKey(row: PriceDisplayRow) {
+  return row.key
+}
+
+function formatPriceValue(value: number | null | undefined) {
+  return typeof value === 'number' ? String(value) : '-'
+}
+
+function renderBillingUnitCell(row: PriceDisplayRow) {
+  const isRequest = row.billing_unit === 'request'
+  return h(
+    'span',
+    {
+      style: {
+        display: 'inline-flex',
+        alignItems: 'center',
+        minHeight: '22px',
+        padding: '2px 8px',
+        borderRadius: '6px',
+        background: isRequest ? 'rgba(16, 185, 129, 0.13)' : 'rgba(124, 58, 237, 0.12)',
+        color: isRequest ? '#047857' : '#6d28d9',
+        fontSize: '12px',
+        fontWeight: '600',
+        lineHeight: '1.2',
+      },
+    },
+    isRequest ? '按次' : '按 Token',
+  )
+}
+
+function renderTokenPriceValue(row: PriceDisplayRow, field: PriceFieldName) {
+  if (row.billing_unit === 'request') {
+    return h('span', { class: 'price-muted' }, '-')
+  }
+  return formatPriceValue(row.price?.[field])
+}
+
+function renderRequestPriceValue(row: PriceDisplayRow) {
+  if (row.billing_unit !== 'request') {
+    return h('span', { class: 'price-muted' }, '-')
+  }
+  if (row.price?.request_usd === null || row.price?.request_usd === undefined) {
+    return h('span', { class: 'price-muted' }, '未定价')
+  }
+  return formatPriceValue(row.price.request_usd)
+}
+
+function renderModelCell(row: PriceDisplayRow) {
+  return h('div', { class: 'model-cell' }, [
+    h('div', { class: 'model-title-row' }, [
+      h('span', { class: 'model-name' }, row.id),
+      row.in_cpa
+        ? h(
+            NTag,
+            {
+              class: 'model-availability-tag',
+              size: 'small',
+              type: 'success',
+              bordered: false,
+              style: { marginLeft: '16px' },
+            },
+            { default: () => 'CPA 可用模型' },
+          )
+        : null,
+    ]),
+    row.name && row.name !== row.id ? h('div', { class: 'model-sub' }, row.name) : null,
+  ])
+}
+
+function renderProviderCell(row: PriceDisplayRow) {
+  return h('div', { class: 'provider-cell' }, [
+    h('div', { class: 'provider-main' }, row.provider || '-'),
+    row.owner && row.owner !== row.provider ? h('div', { class: 'model-sub' }, `Owner: ${row.owner}`) : null,
+  ])
+}
+
+function renderStatusCell(row: PriceDisplayRow) {
+  const label = row.status === 'missing' ? '未定价' : row.status === 'litellm' ? 'LiteLLM' : '手动'
+  const type = row.status === 'missing' ? 'warning' : row.status === 'litellm' ? 'info' : 'default'
+  return h(
+    NTag,
+    { size: 'small', type, bordered: false },
+    { default: () => label },
+  )
+}
+
+const columns: DataTableColumns<PriceDisplayRow> = [
   {
-    title: '来源',
-    key: 'source',
+    title: '模型',
+    key: 'id',
+    width: 380,
+    ellipsis: { tooltip: true },
+    render: renderModelCell,
+  },
+  {
+    title: '服务商',
+    key: 'provider',
+    width: 160,
+    ellipsis: { tooltip: true },
+    render: renderProviderCell,
+  },
+  {
+    title: '定价',
+    key: 'status',
     width: 96,
-    render: (row) =>
-      h(
-        NTag,
-        { size: 'small', type: row.auto_synced ? 'info' : 'default', bordered: false },
-        { default: () => (row.auto_synced ? 'LiteLLM' : '手动') },
-      ),
+    render: renderStatusCell,
+  },
+  {
+    title: '计费方式',
+    key: 'billing_unit',
+    width: 100,
+    render: renderBillingUnitCell,
+  },
+  {
+    title: '每次 ($)',
+    key: 'request_usd',
+    width: 110,
+    render: renderRequestPriceValue,
+  },
+  {
+    title: '输入 ($/MTok)',
+    key: 'input_usd_per_million',
+    width: 125,
+    render: (row) => renderTokenPriceValue(row, 'input_usd_per_million'),
+  },
+  {
+    title: '输出 ($/MTok)',
+    key: 'output_usd_per_million',
+    width: 125,
+    render: (row) => renderTokenPriceValue(row, 'output_usd_per_million'),
+  },
+  {
+    title: '缓存读 ($/MTok)',
+    key: 'cache_read_usd_per_million',
+    width: 125,
+    render: (row) => renderTokenPriceValue(row, 'cache_read_usd_per_million'),
+  },
+  {
+    title: '缓存写 ($/MTok)',
+    key: 'cache_creation_usd_per_million',
+    width: 125,
+    render: (row) => renderTokenPriceValue(row, 'cache_creation_usd_per_million'),
   },
   {
     title: '更新',
     key: 'updated_at',
     width: 140,
-    render: (row) => formatDateTime(row.updated_at),
+    render: (row) => (row.price ? formatDateTime(row.price.updated_at) : '-'),
   },
   {
     title: '',
     key: 'actions',
-    width: 124,
+    width: 132,
     fixed: 'right',
     render: (row) =>
       h(
@@ -344,16 +661,24 @@ const columns: DataTableColumns<ModelPrice> = [
         { size: 4 },
         {
           default: () => [
-            h(
-              NButton,
-              { size: 'small', quaternary: true, onClick: () => openEdit(row) },
-              { default: () => '编辑' },
-            ),
-            h(
-              NButton,
-              { size: 'small', quaternary: true, type: 'error', onClick: () => confirmDelete(row) },
-              { default: () => '删除' },
-            ),
+            row.price
+              ? h(
+                  NButton,
+                  { size: 'small', quaternary: true, onClick: () => openEdit(row.price as ModelPrice) },
+                  { default: () => '改价' },
+                )
+              : h(
+                  NButton,
+                  { size: 'small', type: 'primary', secondary: true, onClick: () => openCreateForRow(row) },
+                  { default: () => '设价' },
+                ),
+            row.price
+              ? h(
+                  NButton,
+                  { size: 'small', quaternary: true, type: 'error', onClick: () => confirmDelete(row.price as ModelPrice) },
+                  { default: () => '删除' },
+                )
+              : null,
           ],
         },
       ),
@@ -375,7 +700,7 @@ onBeforeUnmount(() => {
     <div class="page-header">
       <div>
         <h1 class="page-title">模型价格</h1>
-        <p class="page-subtitle">单位为 USD / 百万 Token，历史费用按当前价格实时重算</p>
+        <p class="page-subtitle">Token 模型按 USD / 百万 Token 计费，image 模型按每次成功调用计费</p>
       </div>
       <NSpace>
         <NButton secondary :loading="isSyncing" @click="syncPrices">
@@ -390,7 +715,7 @@ onBeforeUnmount(() => {
           </template>
           代理配置
         </NButton>
-        <NButton type="primary" @click="openCreate">新增价格</NButton>
+        <NButton type="primary" @click="() => openCreate()">新增价格</NButton>
       </NSpace>
     </div>
 
@@ -406,28 +731,40 @@ onBeforeUnmount(() => {
     </div>
 
     <section class="panel table-panel price-table-panel">
-      <div class="table-toolbar">
-        <NSpace class="price-toolbar-layout" justify="space-between" align="center">
-          <NSpace class="price-filters" align="center" :size="8">
-            <span class="filter-label">服务商</span>
-            <NSelect
-              v-model:value="selectedProvider"
-              class="provider-filter"
-              :options="providerOptions"
-              clearable
-              filterable
-              placeholder="全部服务商"
-            />
-            <NInput
-              v-model:value="searchQuery"
-              class="price-search"
-              clearable
-              placeholder="搜索服务商或模型"
-              :render-prefix="renderSearchIcon"
-            />
+      <div class="price-table-top">
+        <NAlert v-if="catalogNotice" class="price-alert" type="warning" :show-icon="false">
+          {{ catalogNotice }}
+        </NAlert>
+        <div class="table-toolbar">
+          <NSpace class="price-toolbar-layout" justify="space-between" align="center">
+            <NSpace class="price-filters" align="center" :size="8">
+              <span class="filter-label">服务商</span>
+              <NSelect
+                v-model:value="selectedProvider"
+                class="provider-filter"
+                :options="providerOptions"
+                clearable
+                filterable
+                placeholder="全部服务商"
+              />
+              <NSelect
+                v-model:value="selectedStatus"
+                class="status-filter"
+                :options="statusOptions"
+                clearable
+                placeholder="全部状态"
+              />
+              <NInput
+                v-model:value="searchQuery"
+                class="price-search"
+                clearable
+                placeholder="搜索模型或服务商"
+                :render-prefix="renderSearchIcon"
+              />
+            </NSpace>
+            <span class="result-count">共 {{ filteredPriceCount }} / {{ totalPriceCount }} 条</span>
           </NSpace>
-          <span class="result-count">共 {{ filteredPriceCount }} / {{ totalPriceCount }} 条</span>
-        </NSpace>
+        </div>
       </div>
       <NDataTable
         class="price-table"
@@ -437,7 +774,8 @@ onBeforeUnmount(() => {
         :columns="columns"
         :data="filteredPrices"
         :pagination="pagination"
-        :scroll-x="1370"
+        :row-key="rowKey"
+        :scroll-x="1620"
       />
     </section>
 
@@ -456,20 +794,26 @@ onBeforeUnmount(() => {
           <NFormItem label="模型">
             <NInput v-model:value="form.model" />
           </NFormItem>
-          <NFormItem label="输入价格">
-            <NInputNumber v-model:value="form.input_usd_per_million" :min="0" />
+          <NFormItem v-if="isRequestPriceForm" label="每次调用价格 USD" class="wide-form-item">
+            <NInputNumber v-model:value="form.request_usd" :min="0" placeholder="例如：0.04" />
           </NFormItem>
-          <NFormItem label="输出价格">
-            <NInputNumber v-model:value="form.output_usd_per_million" :min="0" />
-          </NFormItem>
-          <NFormItem label="缓存读价格">
-            <NInputNumber v-model:value="form.cache_read_usd_per_million" :min="0" />
-          </NFormItem>
-          <NFormItem label="缓存写价格">
-            <NInputNumber v-model:value="form.cache_creation_usd_per_million" :min="0" />
-          </NFormItem>
+          <template v-else>
+            <NFormItem label="输入价格">
+              <NInputNumber v-model:value="form.input_usd_per_million" :min="0" />
+            </NFormItem>
+            <NFormItem label="输出价格">
+              <NInputNumber v-model:value="form.output_usd_per_million" :min="0" />
+            </NFormItem>
+            <NFormItem label="缓存读价格">
+              <NInputNumber v-model:value="form.cache_read_usd_per_million" :min="0" />
+            </NFormItem>
+            <NFormItem label="缓存写价格">
+              <NInputNumber v-model:value="form.cache_creation_usd_per_million" :min="0" />
+            </NFormItem>
+          </template>
         </div>
       </NForm>
+      <p class="price-save-hint">{{ priceSaveHint }}</p>
       <template #footer>
         <NSpace justify="end">
           <NButton @click="modalOpen = false">取消</NButton>
@@ -532,6 +876,10 @@ onBeforeUnmount(() => {
   gap: 8px 12px;
 }
 
+.wide-form-item {
+  grid-column: 1 / -1;
+}
+
 .proxy-form {
   display: grid;
   gap: 14px;
@@ -573,6 +921,10 @@ onBeforeUnmount(() => {
   grid-template-columns: repeat(4, minmax(150px, 1fr));
 }
 
+.price-alert {
+  border-radius: var(--cpa-radius);
+}
+
 .price-table-panel,
 .price-table {
   min-width: 0;
@@ -581,6 +933,11 @@ onBeforeUnmount(() => {
 
 .price-table-panel {
   overflow: hidden;
+}
+
+.price-table-top {
+  display: grid;
+  gap: 8px;
 }
 
 .table-toolbar {
@@ -612,6 +969,10 @@ onBeforeUnmount(() => {
   width: 220px;
 }
 
+.status-filter {
+  width: 150px;
+}
+
 .price-filters {
   min-width: 0;
   max-width: 100%;
@@ -619,6 +980,52 @@ onBeforeUnmount(() => {
 
 .price-search {
   width: 280px;
+}
+
+.model-cell,
+.provider-cell {
+  min-width: 0;
+}
+
+.model-title-row {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  min-width: 0;
+}
+
+.model-availability-tag {
+  flex: 0 0 auto;
+  margin-left: 2px;
+}
+
+.model-name,
+.provider-main {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--cpa-text);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-sub {
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--cpa-text-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.price-muted {
+  color: var(--cpa-text-muted);
+}
+
+.price-save-hint {
+  margin: 4px 0 0;
+  color: var(--cpa-text-muted);
+  font-size: 13px;
 }
 
 @media (min-width: 861px) {
@@ -656,6 +1063,10 @@ onBeforeUnmount(() => {
     width: min(200px, calc(100vw - 32px));
   }
 
+  .status-filter {
+    width: min(160px, calc(100vw - 32px));
+  }
+
   .price-search {
     width: min(240px, calc(100vw - 32px));
   }
@@ -687,6 +1098,7 @@ onBeforeUnmount(() => {
   }
 
   .provider-filter,
+  .status-filter,
   .price-search {
     width: 100%;
   }

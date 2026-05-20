@@ -178,6 +178,7 @@ func rebuildModelPricesForCachePrices(ctx context.Context, tx *sql.Tx) error {
 		{"output_usd_per_million", coalesceExpr(cols, "0", "output_usd_per_million")},
 		{"cache_read_usd_per_million", coalesceExpr(cols, "0", "cache_read_usd_per_million", "cached_usd_per_million")},
 		{"cache_creation_usd_per_million", coalesceExpr(cols, "0", "cache_creation_usd_per_million")},
+		{"request_usd", nullableExpr(cols, "request_usd")},
 		{"source", coalesceTextExpr(cols, "'manual'", "source")},
 		{"source_model", nullableTextExpr(cols, "source_model")},
 		{"auto_synced", coalesceExpr(cols, "0", "auto_synced")},

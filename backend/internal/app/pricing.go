@@ -5,14 +5,18 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
 const defaultLiteLLMPricingURL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+const modelBillingUnitToken = "token"
+const modelBillingUnitRequest = "request"
 
 type ModelPrice struct {
 	ID                         int        `json:"id"`
@@ -22,6 +26,8 @@ type ModelPrice struct {
 	OutputUSDPerMillion        float64    `json:"output_usd_per_million"`
 	CacheReadUSDPerMillion     float64    `json:"cache_read_usd_per_million"`
 	CacheCreationUSDPerMillion float64    `json:"cache_creation_usd_per_million"`
+	RequestUSD                 *float64   `json:"request_usd"`
+	BillingUnit                string     `json:"billing_unit"`
 	Source                     string     `json:"source"`
 	SourceModel                *string    `json:"source_model"`
 	AutoSynced                 bool       `json:"auto_synced"`
@@ -30,12 +36,13 @@ type ModelPrice struct {
 }
 
 type modelPricePayload struct {
-	Provider                   string  `json:"provider"`
-	Model                      string  `json:"model"`
-	InputUSDPerMillion         float64 `json:"input_usd_per_million"`
-	OutputUSDPerMillion        float64 `json:"output_usd_per_million"`
-	CacheReadUSDPerMillion     float64 `json:"cache_read_usd_per_million"`
-	CacheCreationUSDPerMillion float64 `json:"cache_creation_usd_per_million"`
+	Provider                   string   `json:"provider"`
+	Model                      string   `json:"model"`
+	InputUSDPerMillion         float64  `json:"input_usd_per_million"`
+	OutputUSDPerMillion        float64  `json:"output_usd_per_million"`
+	CacheReadUSDPerMillion     float64  `json:"cache_read_usd_per_million"`
+	CacheCreationUSDPerMillion float64  `json:"cache_creation_usd_per_million"`
+	RequestUSD                 *float64 `json:"request_usd"`
 }
 
 type modelPriceSyncRequest struct {
@@ -45,6 +52,33 @@ type modelPriceSyncRequest struct {
 type liteLLMProxySettingsPayload struct {
 	Enabled  *bool   `json:"enabled"`
 	ProxyURL *string `json:"proxy_url"`
+}
+
+type ModelPriceCatalogItem struct {
+	ID                string                 `json:"id"`
+	Name              string                 `json:"name"`
+	Object            *string                `json:"object"`
+	Owner             *string                `json:"owner"`
+	Created           *int                   `json:"created"`
+	Metadata          map[string]any         `json:"metadata"`
+	SuggestedProvider string                 `json:"suggested_provider"`
+	Price             *ModelPrice            `json:"price"`
+	Sources           []AvailableModelSource `json:"sources"`
+}
+
+type ModelPriceCatalogResponse struct {
+	HasAPIKeys           bool                     `json:"has_api_keys"`
+	APIKeyCount          int                      `json:"api_key_count"`
+	QueryableAPIKeyCount int                      `json:"queryable_api_key_count"`
+	Models               []ModelPriceCatalogItem  `json:"models"`
+	Errors               []AvailableModelKeyError `json:"errors"`
+	PricedModels         int                      `json:"priced_models"`
+	UnpricedModels       int                      `json:"unpriced_models"`
+}
+
+type modelCatalogAPIKey struct {
+	UserAPIKey
+	UserLabel string
 }
 
 func (a *App) handleModelPrices(w http.ResponseWriter, r *http.Request) error {
@@ -94,6 +128,20 @@ func (a *App) handleModelPriceByPath(w http.ResponseWriter, r *http.Request) err
 			return err
 		}
 		return a.handleLiteLLMProxySettings(w, r)
+	}
+	if path == "catalog" {
+		if _, err := a.adminUser(r.Context(), r); err != nil {
+			return err
+		}
+		if err := requireMethod(r, http.MethodGet); err != nil {
+			return err
+		}
+		response, err := a.modelPriceCatalog(r.Context())
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, response)
+		return nil
 	}
 	if _, err := a.adminUser(r.Context(), r); err != nil {
 		return err
@@ -179,7 +227,11 @@ func validatePricePayload(payload modelPricePayload) (modelPricePayload, error) 
 	if payload.Provider == "" || payload.Model == "" {
 		return payload, validationError("provider/model 不能为空")
 	}
-	if payload.InputUSDPerMillion < 0 || payload.OutputUSDPerMillion < 0 || payload.CacheReadUSDPerMillion < 0 || payload.CacheCreationUSDPerMillion < 0 {
+	if !finiteNonNegative(payload.InputUSDPerMillion) ||
+		!finiteNonNegative(payload.OutputUSDPerMillion) ||
+		!finiteNonNegative(payload.CacheReadUSDPerMillion) ||
+		!finiteNonNegative(payload.CacheCreationUSDPerMillion) ||
+		(payload.RequestUSD != nil && !finiteNonNegative(*payload.RequestUSD)) {
 		return payload, validationError("价格不能为负数")
 	}
 	return payload, nil
@@ -188,8 +240,8 @@ func validatePricePayload(payload modelPricePayload) (modelPricePayload, error) 
 func (a *App) listPrices(ctx context.Context) ([]ModelPrice, error) {
 	rows, err := a.db.QueryContext(ctx, `
 		SELECT id, provider, model, input_usd_per_million, output_usd_per_million,
-		       cache_read_usd_per_million, cache_creation_usd_per_million, source,
-		       source_model, auto_synced, CAST(last_synced_at AS TEXT), CAST(updated_at AS TEXT)
+		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
+		       source, source_model, auto_synced, CAST(last_synced_at AS TEXT), CAST(updated_at AS TEXT)
 		FROM model_prices
 		ORDER BY auto_synced ASC, lower(provider), lower(model)
 	`)
@@ -212,14 +264,228 @@ func (a *App) priceMap(ctx context.Context) (map[[2]string]ModelPrice, error) {
 	return result, nil
 }
 
+func (a *App) modelPriceCatalog(ctx context.Context) (ModelPriceCatalogResponse, error) {
+	bindings, err := a.modelCatalogAPIKeys(ctx)
+	if err != nil {
+		return ModelPriceCatalogResponse{}, err
+	}
+	response := ModelPriceCatalogResponse{
+		HasAPIKeys:  len(bindings) > 0,
+		APIKeyCount: len(bindings),
+		Models:      []ModelPriceCatalogItem{},
+		Errors:      []AvailableModelKeyError{},
+	}
+	queryable := make([]modelCatalogAPIKey, 0, len(bindings))
+	for _, binding := range bindings {
+		if binding.APIKey != nil && strings.TrimSpace(*binding.APIKey) != "" {
+			queryable = append(queryable, binding)
+		}
+	}
+	response.QueryableAPIKeyCount = len(queryable)
+	if len(queryable) == 0 {
+		return response, nil
+	}
+	cfg, err := a.loadConfig(ctx)
+	if err != nil {
+		return ModelPriceCatalogResponse{}, err
+	}
+	prices, err := a.listPrices(ctx)
+	if err != nil {
+		return ModelPriceCatalogResponse{}, err
+	}
+	priceLookup := pricesByKey(prices)
+	modelsByID := map[string]AvailableModelItem{}
+	for _, binding := range queryable {
+		source := catalogAvailableModelSource(binding)
+		models, err := fetchAvailableModelItems(ctx, cfg, *binding.APIKey)
+		if err != nil {
+			response.Errors = append(response.Errors, AvailableModelKeyError{
+				APIKeyHash:    source.APIKeyHash,
+				APIKeyPreview: source.APIKeyPreview,
+				Description:   source.Description,
+				Message:       err.Error(),
+			})
+			continue
+		}
+		for _, raw := range models {
+			model := parseAvailableModel(raw, source)
+			if model == nil {
+				continue
+			}
+			existing, ok := modelsByID[model.ID]
+			if !ok {
+				modelsByID[model.ID] = *model
+				continue
+			}
+			mergeAvailableModel(&existing, *model)
+			modelsByID[model.ID] = existing
+		}
+	}
+	for _, model := range modelsByID {
+		suggestedProvider := suggestedPriceProvider(model)
+		price := findCatalogPrice(priceLookup, prices, suggestedProvider, model.Owner, model.ID)
+		item := ModelPriceCatalogItem{
+			ID:                model.ID,
+			Name:              model.Name,
+			Object:            model.Object,
+			Owner:             model.Owner,
+			Created:           model.Created,
+			Metadata:          model.Metadata,
+			SuggestedProvider: suggestedProvider,
+			Price:             price,
+			Sources:           model.Sources,
+		}
+		if item.Metadata == nil {
+			item.Metadata = map[string]any{}
+		}
+		if !modelPriceReadyForBilling(item.Price, item.ID) {
+			response.UnpricedModels++
+		} else {
+			response.PricedModels++
+		}
+		response.Models = append(response.Models, item)
+	}
+	sort.Slice(response.Models, func(i, j int) bool {
+		left, right := response.Models[i], response.Models[j]
+		if (left.Price == nil) != (right.Price == nil) {
+			return left.Price == nil
+		}
+		return strings.ToLower(left.ID) < strings.ToLower(right.ID)
+	})
+	return response, nil
+}
+
+func (a *App) modelCatalogAPIKeys(ctx context.Context) ([]modelCatalogAPIKey, error) {
+	rows, err := a.db.QueryContext(ctx, `
+		SELECT k.api_key_hash, k.user_id, k.api_key, k.description, CAST(k.created_at AS TEXT), CAST(k.updated_at AS TEXT),
+		       u.username, u.nickname
+		FROM user_api_keys k
+		INNER JOIN users u ON u.id = k.user_id
+		WHERE u.disabled_at IS NULL
+		ORDER BY lower(u.username), lower(k.description), k.api_key_hash
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []modelCatalogAPIKey
+	for rows.Next() {
+		var item modelCatalogAPIKey
+		var apiKey, createdAt, updatedAt, username, nickname sql.NullString
+		if err := rows.Scan(&item.APIKeyHash, &item.UserID, &apiKey, &item.Description, &createdAt, &updatedAt, &username, &nickname); err != nil {
+			return nil, err
+		}
+		item.APIKey = nullableString(apiKey)
+		item.CreatedAt = timePtr(createdAt)
+		item.UpdatedAt = timePtr(updatedAt)
+		item.UserLabel = userLabelFromParts(username, nickname)
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+func pricesByKey(prices []ModelPrice) map[[2]string]ModelPrice {
+	result := make(map[[2]string]ModelPrice, len(prices))
+	for _, price := range prices {
+		result[priceKey(price.Provider, price.Model)] = price
+	}
+	return result
+}
+
+func catalogAvailableModelSource(binding modelCatalogAPIKey) AvailableModelSource {
+	source := availableModelSource(binding.UserAPIKey)
+	userID := binding.UserID
+	source.UserID = &userID
+	source.UserLabel = binding.UserLabel
+	return source
+}
+
+func userLabelFromParts(username, nickname sql.NullString) string {
+	label := strings.TrimSpace(nickname.String)
+	if label == "" {
+		label = strings.TrimSpace(username.String)
+	}
+	if label == "" {
+		label = "未知用户"
+	}
+	return label
+}
+
+func suggestedPriceProvider(model AvailableModelItem) string {
+	if model.Owner != nil {
+		if owner := strings.TrimSpace(*model.Owner); owner != "" {
+			return owner
+		}
+	}
+	if idx := strings.Index(model.ID, "/"); idx > 0 {
+		return strings.TrimSpace(model.ID[:idx])
+	}
+	return ""
+}
+
+func findCatalogPrice(prices map[[2]string]ModelPrice, allPrices []ModelPrice, suggestedProvider string, owner *string, modelID string) *ModelPrice {
+	providers := []string{}
+	if owner != nil {
+		providers = append(providers, *owner)
+	}
+	if strings.TrimSpace(suggestedProvider) != "" {
+		providers = append(providers, suggestedProvider)
+	}
+	modelCandidates := catalogModelCandidates(modelID)
+	for _, provider := range providers {
+		for _, candidate := range modelCandidates {
+			if price := findMatchingPrice(prices, &provider, &candidate); price != nil {
+				return price
+			}
+		}
+	}
+	var matched *ModelPrice
+	for _, price := range allPrices {
+		priceModel := strings.ToLower(strings.TrimSpace(price.Model))
+		modelMatches := false
+		for _, candidate := range modelCandidates {
+			if priceModel == strings.ToLower(strings.TrimSpace(candidate)) {
+				modelMatches = true
+				break
+			}
+		}
+		if !modelMatches {
+			continue
+		}
+		if matched != nil {
+			return nil
+		}
+		candidate := price
+		matched = &candidate
+	}
+	return matched
+}
+
+func catalogModelCandidates(modelID string) []string {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return nil
+	}
+	candidates := []string{modelID}
+	if idx := strings.Index(modelID, "/"); idx > 0 && idx < len(modelID)-1 {
+		candidates = append(candidates, strings.TrimSpace(modelID[idx+1:]))
+	}
+	return candidates
+}
+
 func scanPrices(rows *sql.Rows) ([]ModelPrice, error) {
 	var prices []ModelPrice
 	for rows.Next() {
 		var price ModelPrice
 		var sourceModel, lastSynced, updatedAt sql.NullString
-		if err := rows.Scan(&price.ID, &price.Provider, &price.Model, &price.InputUSDPerMillion, &price.OutputUSDPerMillion, &price.CacheReadUSDPerMillion, &price.CacheCreationUSDPerMillion, &price.Source, &sourceModel, &price.AutoSynced, &lastSynced, &updatedAt); err != nil {
+		var requestUSD sql.NullFloat64
+		if err := rows.Scan(&price.ID, &price.Provider, &price.Model, &price.InputUSDPerMillion, &price.OutputUSDPerMillion, &price.CacheReadUSDPerMillion, &price.CacheCreationUSDPerMillion, &requestUSD, &price.Source, &sourceModel, &price.AutoSynced, &lastSynced, &updatedAt); err != nil {
 			return nil, err
 		}
+		if requestUSD.Valid {
+			price.RequestUSD = &requestUSD.Float64
+		}
+		price.BillingUnit = billingUnitForModel(price.Model)
 		price.SourceModel = nullableString(sourceModel)
 		price.LastSyncedAt = timePtr(lastSynced)
 		if parsed, ok := parseDBTime(updatedAt.String); ok {
@@ -239,10 +505,10 @@ func (a *App) createPrice(ctx context.Context, payload modelPricePayload) (Model
 	result, err := a.db.ExecContext(ctx, `
 		INSERT INTO model_prices (
 			provider, model, input_usd_per_million, output_usd_per_million,
-			cache_read_usd_per_million, cache_creation_usd_per_million, source,
-			source_model, auto_synced, last_synced_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, 'manual', NULL, 0, NULL, ?)
-	`, payload.Provider, payload.Model, payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, now)
+			cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
+			source, source_model, auto_synced, last_synced_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', NULL, 0, NULL, ?)
+	`, payload.Provider, payload.Model, payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), now)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return ModelPrice{}, conflictError("该 provider/model 价格已存在")
@@ -261,10 +527,11 @@ func (a *App) updatePrice(ctx context.Context, id int, payload modelPricePayload
 	result, err := a.db.ExecContext(ctx, `
 		UPDATE model_prices
 		SET provider = ?, model = ?, input_usd_per_million = ?, output_usd_per_million = ?,
-		    cache_read_usd_per_million = ?, cache_creation_usd_per_million = ?, source = 'manual',
+		    cache_read_usd_per_million = ?, cache_creation_usd_per_million = ?,
+		    request_usd = ?, source = 'manual',
 		    source_model = NULL, auto_synced = 0, last_synced_at = NULL, updated_at = ?
 		WHERE id = ?
-	`, payload.Provider, payload.Model, payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, dbTime(time.Now()), id)
+	`, payload.Provider, payload.Model, payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), dbTime(time.Now()), id)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return ModelPrice{}, conflictError("该 provider/model 价格已存在")
@@ -293,8 +560,8 @@ func (a *App) deletePrice(ctx context.Context, id int) error {
 func (a *App) getPrice(ctx context.Context, id int) (ModelPrice, error) {
 	rows, err := a.db.QueryContext(ctx, `
 		SELECT id, provider, model, input_usd_per_million, output_usd_per_million,
-		       cache_read_usd_per_million, cache_creation_usd_per_million, source,
-		       source_model, auto_synced, CAST(last_synced_at AS TEXT), CAST(updated_at AS TEXT)
+		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
+		       source, source_model, auto_synced, CAST(last_synced_at AS TEXT), CAST(updated_at AS TEXT)
 		FROM model_prices WHERE id = ?
 	`, id)
 	if err != nil {
@@ -392,10 +659,10 @@ func (a *App) syncLiteLLMPrices(ctx context.Context, sourceURL string, rawData m
 		result, err := tx.ExecContext(ctx, `
 			INSERT OR IGNORE INTO model_prices (
 				provider, model, input_usd_per_million, output_usd_per_million,
-				cache_read_usd_per_million, cache_creation_usd_per_million, source,
-				source_model, auto_synced, last_synced_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, 'litellm', ?, 1, ?, ?)
-		`, payload.Provider, payload.Model, payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, row.modelName, now, now)
+				cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
+				source, source_model, auto_synced, last_synced_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, 'litellm', ?, 1, ?, ?)
+		`, payload.Provider, payload.Model, payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), row.modelName, now, now)
 		if err != nil {
 			return nil, err
 		}
@@ -485,7 +752,8 @@ func pricesEqual(item ModelPrice, payload modelPricePayload) bool {
 		item.InputUSDPerMillion == payload.InputUSDPerMillion &&
 		item.OutputUSDPerMillion == payload.OutputUSDPerMillion &&
 		item.CacheReadUSDPerMillion == payload.CacheReadUSDPerMillion &&
-		item.CacheCreationUSDPerMillion == payload.CacheCreationUSDPerMillion
+		item.CacheCreationUSDPerMillion == payload.CacheCreationUSDPerMillion &&
+		floatPtrEqual(item.RequestUSD, payload.RequestUSD)
 }
 
 func priceKey(provider, model string) [2]string {
@@ -518,6 +786,15 @@ func findMatchingPrice(prices map[[2]string]ModelPrice, provider, model *string)
 
 func recordCost(record UsageRecord, prices map[[2]string]ModelPrice) (float64, bool) {
 	price := findMatchingPrice(prices, record.Provider, record.Model)
+	if billingUnitForModelPtr(record.Model) == modelBillingUnitRequest {
+		if record.Failed {
+			return 0, false
+		}
+		if price == nil || price.RequestUSD == nil {
+			return 0, true
+		}
+		return mathRound(*price.RequestUSD, 8), false
+	}
 	if price == nil {
 		return 0, usageAggregateTotalTokens(record) > 0
 	}
@@ -634,4 +911,50 @@ func nonNegativeTokens(tokens int) int {
 
 func millionTokenCost(tokens int, usdPerMillion float64) float64 {
 	return float64(tokens) / 1_000_000 * usdPerMillion
+}
+
+func finiteNonNegative(value float64) bool {
+	return value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func nullableFloatArg(value *float64) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func floatPtrEqual(left, right *float64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func billingUnitForModel(model string) string {
+	if strings.Contains(strings.ToLower(strings.TrimSpace(model)), "image") {
+		return modelBillingUnitRequest
+	}
+	return modelBillingUnitToken
+}
+
+func billingUnitForModelPtr(model *string) string {
+	if model == nil {
+		return modelBillingUnitToken
+	}
+	return billingUnitForModel(*model)
+}
+
+func modelPriceReadyForBilling(price *ModelPrice, fallbackModel string) bool {
+	if price == nil {
+		return false
+	}
+	model := price.Model
+	if strings.TrimSpace(model) == "" {
+		model = fallbackModel
+	}
+	if billingUnitForModel(model) == modelBillingUnitRequest {
+		return price.RequestUSD != nil
+	}
+	return true
 }

@@ -1771,6 +1771,9 @@ func (a *App) conditionalKeeperRefreshCandidates(ctx context.Context, cfg AppCon
 	for _, name := range a.keeperAuthNamesFromRemoteUsageIdentifiers(ctx, cfg, usageIdentifiers, aliases) {
 		addName(name)
 	}
+	if err := a.reconcileKeeperConditionalRemoteAuthStates(ctx, cfg, addName); err != nil {
+		return nil, err
+	}
 
 	rows, err = a.db.QueryContext(ctx, `
 		SELECT auth_name
@@ -1799,6 +1802,58 @@ func (a *App) conditionalKeeperRefreshCandidates(ctx context.Context, cfg AppCon
 
 	filtered, _, err := a.filterKeeperCachedAuthNames(ctx, names, cfg)
 	return filtered, err
+}
+
+func (a *App) reconcileKeeperConditionalRemoteAuthStates(ctx context.Context, cfg AppConfig, addName func(string)) error {
+	if strings.TrimSpace(cfg.Collector.CLIProxyURL) == "" {
+		return nil
+	}
+	authFiles, err := a.listKeeperRemoteAuthFiles(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	remoteNames := map[string]bool{}
+	for _, item := range authFiles {
+		if keeperString(item["type"]) != "codex" {
+			continue
+		}
+		name := keeperString(item["name"])
+		if name == "" {
+			continue
+		}
+		remoteNames[name] = true
+	}
+	localNames, err := a.keeperAuthStateNameSet(ctx)
+	if err != nil {
+		return err
+	}
+	for name := range remoteNames {
+		if !localNames[name] {
+			addName(name)
+		}
+	}
+	_, err = a.pruneKeeperMissingAuthStates(ctx, remoteNames)
+	return err
+}
+
+func (a *App) keeperAuthStateNameSet(ctx context.Context) (map[string]bool, error) {
+	rows, err := a.db.QueryContext(ctx, `SELECT auth_name FROM codex_keeper_auth_states`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	names := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return names, nil
 }
 
 func (a *App) keeperAuthNameAliases(ctx context.Context) (map[string][]string, error) {

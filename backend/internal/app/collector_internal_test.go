@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestConsumeRespQueueUsesHTTPManagementUsageQueue(t *testing.T) {
@@ -72,5 +73,100 @@ func TestUsesRespQueueProtocolOnlyForExplicitRawProtocols(t *testing.T) {
 		if got := usesRespQueueProtocol(rawURL); got != want {
 			t.Fatalf("usesRespQueueProtocol(%q) = %v, want %v", rawURL, got, want)
 		}
+	}
+}
+
+func TestSyncRemoteUsageEnabledClearsDisabledCollectorStaleErrorOnSuccess(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v0/management/usage-statistics-enabled" {
+			t.Fatalf("path = %q, want /v0/management/usage-statistics-enabled", r.URL.Path)
+		}
+		if got := r.Header.Get("X-Management-Key"); got != "test-management-key" {
+			t.Fatalf("management header = %q, want test-management-key", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]bool{"usage-statistics-enabled": true})
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	app.collector.Stop()
+
+	ctx := context.Background()
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
+	cfg.Collector.Enabled = false
+
+	staleError := "remote usage toggle query failed: timeout"
+	if err := app.collector.updateState(ctx, collectorPatch{LastError: &staleError}); err != nil {
+		t.Fatalf("updateState failed: %v", err)
+	}
+	app.collector.mu.Lock()
+	app.collector.lastRemoteSyncAt = time.Time{}
+	app.collector.mu.Unlock()
+
+	app.collector.syncRemoteUsageEnabled(ctx, cfg)
+
+	state, err := app.collectorState(ctx)
+	if err != nil {
+		t.Fatalf("collectorState failed: %v", err)
+	}
+	if state.LastError != nil {
+		t.Fatalf("last error = %q, want cleared", *state.LastError)
+	}
+	if state.RemoteEnabled == nil || !*state.RemoteEnabled {
+		t.Fatalf("remote enabled = %v, want true", state.RemoteEnabled)
+	}
+}
+
+func TestSyncRemoteUsageEnabledKeepsEnabledCollectorErrorOnSuccess(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]bool{"usage-statistics-enabled": true})
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	app.collector.Stop()
+
+	ctx := context.Background()
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
+	cfg.Collector.Enabled = true
+
+	collectorError := "usage queue HTTP 500"
+	if err := app.collector.updateState(ctx, collectorPatch{LastError: &collectorError}); err != nil {
+		t.Fatalf("updateState failed: %v", err)
+	}
+	app.collector.mu.Lock()
+	app.collector.lastRemoteSyncAt = time.Time{}
+	app.collector.mu.Unlock()
+
+	app.collector.syncRemoteUsageEnabled(ctx, cfg)
+
+	state, err := app.collectorState(ctx)
+	if err != nil {
+		t.Fatalf("collectorState failed: %v", err)
+	}
+	if state.LastError == nil || *state.LastError != collectorError {
+		t.Fatalf("last error = %v, want %q", state.LastError, collectorError)
 	}
 }

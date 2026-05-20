@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { Component } from 'vue'
-import { computed, h, onMounted, ref } from 'vue'
+import { computed, h, onMounted, ref, watch } from 'vue'
 import {
   NAlert,
   NButton,
@@ -10,21 +10,46 @@ import {
   NIcon,
   NInput,
   NModal,
+  NRadioButton,
+  NRadioGroup,
+  NSelect,
   NSpace,
   useDialog,
   useMessage,
   type DataTableColumns,
 } from 'naive-ui'
-import { Activity, CircleDollarSign, Eye, EyeOff, KeyRound, Layers3 } from 'lucide-vue-next'
+import {
+  Activity,
+  CircleDollarSign,
+  Copy,
+  Eye,
+  EyeOff,
+  KeyRound,
+  Layers3,
+  Send,
+} from 'lucide-vue-next'
 
 import {
   createApiKey,
   deleteApiKey,
+  getModelRequestGuide,
   listApiKeys,
+  testModelRequest,
   updateApiKey,
 } from '@/features/api-keys/api/apiKeysApi'
+import { listAvailableModels } from '@/features/models/api/availableModelsApi'
+import { getCurrentUserQuota } from '@/features/users/api/usersApi'
 import { getUsageOverview } from '@/features/usage/api/usageApi'
-import type { UsageSummary, UserApiKeySummary } from '@/shared/types/api'
+import type {
+  AvailableModel,
+  AvailableModelsResponse,
+  ModelRequestEndpoint,
+  ModelRequestGuide,
+  ModelRequestTestResponse,
+  UsageSummary,
+  UserApiKeySummary,
+  UserQuotaStatus,
+} from '@/shared/types/api'
 import { copyToClipboard } from '@/shared/utils/clipboard'
 import { formatCompact, formatDateTime, formatInteger, formatUsd } from '@/shared/utils/format'
 
@@ -34,12 +59,56 @@ const isLoading = ref(false)
 const isSaving = ref(false)
 const apiKeys = ref<UserApiKeySummary[]>([])
 const usageSummary = ref<UsageSummary | null>(null)
+const quotaStatus = ref<UserQuotaStatus | null>(null)
+const modelRequestGuide = ref<ModelRequestGuide | null>(null)
+const availableModels = ref<AvailableModelsResponse | null>(null)
 const editorVisible = ref(false)
+const requestTestVisible = ref(false)
+const requestTestApiKey = ref<UserApiKeySummary | null>(null)
+const requestEndpoint = ref<ModelRequestEndpoint>('chat_completions')
+const requestTestModel = ref<string | null>(null)
+const requestTestMessage = ref('请用一句中文回复：连接测试成功。')
+const requestTestResult = ref<ModelRequestTestResponse | null>(null)
+const requestTestError = ref<string | null>(null)
+const isAvailableModelsLoading = ref(false)
+const isRequestTesting = ref(false)
 const editingApiKeyHash = ref<string | null>(null)
 const apiKeyDescription = ref('VSCode')
 const generatedApiKey = ref<string | null>(null)
 const generatedApiKeyHash = ref<string | null>(null)
 const visibleApiKeyHashes = ref<Set<string>>(new Set())
+
+const requestLoadingText = '加载中'
+
+interface RequestEndpointOption {
+  label: string
+  value: ModelRequestEndpoint
+  path: string
+  urlLabel: string
+}
+
+const chatCompletionsEndpointOption: RequestEndpointOption = {
+  label: 'Chat Completions',
+  value: 'chat_completions',
+  path: '/chat/completions',
+  urlLabel: 'Chat Completions URL',
+}
+
+const requestEndpointOptions: RequestEndpointOption[] = [
+  chatCompletionsEndpointOption,
+  {
+    label: 'Responses',
+    value: 'responses',
+    path: '/responses',
+    urlLabel: 'Responses URL',
+  },
+  {
+    label: 'Claude Messages',
+    value: 'claude_messages',
+    path: '/messages',
+    urlLabel: 'Claude Messages URL',
+  },
+]
 
 interface ApiKeyMetricCard {
   key: string
@@ -56,6 +125,7 @@ const apiKeyMetrics = computed<ApiKeyMetricCard[]>(() => {
   const failedToday = summary?.failed_records ?? 0
   const todayCost = summary?.estimated_cost_usd ?? 0
   const todayTokens = summary?.total_tokens ?? 0
+  const quota = quotaStatus.value
   return [
     {
       key: 'keys',
@@ -89,8 +159,180 @@ const apiKeyMetrics = computed<ApiKeyMetricCard[]>(() => {
       tone: 'green',
       icon: CircleDollarSign,
     },
+    {
+      key: 'quota',
+      label: '可用余额',
+      value: quotaValueText(quota),
+      footnote: quotaFootnote(quota),
+      tone: quota?.paused ? 'purple' : 'green',
+      icon: CircleDollarSign,
+    },
   ]
 })
+
+const canCreateApiKey = computed(() => quotaStatus.value?.can_create_keys ?? true)
+
+const requestBaseURL = computed(() => modelRequestGuide.value?.openai_base_url ?? requestLoadingText)
+const requestEndpointMeta = computed(
+  () =>
+    requestEndpointOptions.find((option) => option.value === requestEndpoint.value) ??
+    chatCompletionsEndpointOption,
+)
+const requestEndpointURL = computed(() => {
+  const baseURL = modelRequestGuide.value?.openai_base_url
+  if (!baseURL) {
+    return requestLoadingText
+  }
+  return `${baseURL.replace(/\/$/, '')}${requestEndpointMeta.value.path}`
+})
+const requestEndpointURLLabel = computed(() => requestEndpointMeta.value.urlLabel)
+const requestTestApiKeyText = computed(() => requestTestApiKey.value?.api_key || '<你的 API KEY>')
+const requestHeaderLines = computed(() => {
+  if (requestEndpoint.value === 'claude_messages') {
+    return [`x-api-key: ${requestTestApiKeyText.value}`, 'anthropic-version: 2023-06-01']
+  }
+  return [`Authorization: Bearer ${requestTestApiKeyText.value}`]
+})
+const requestHeadersText = computed(() => requestHeaderLines.value.join('\n'))
+const sampleRequest = computed(() => {
+  const targetURL =
+    requestEndpointURL.value === requestLoadingText
+      ? `<${requestEndpointURLLabel.value}>`
+      : requestEndpointURL.value
+  const model = requestTestModel.value || '<模型名>'
+  const content = requestTestMessage.value.trim() || '你好'
+  const body = requestBodyForEndpoint(requestEndpoint.value, model, content)
+  return [
+    `curl ${targetURL} \\`,
+    ...requestHeaderLines.value.map((header) => `  -H "${header}" \\`),
+    '  -H "Content-Type: application/json" \\',
+    `  -d ${quoteForCurl(JSON.stringify(body))}`,
+  ].join('\n')
+})
+const requestTestModelOptions = computed(() => {
+  const selectedHash = requestTestApiKey.value?.api_key_hash
+  const models = availableModels.value?.models ?? []
+  const filtered = selectedHash
+    ? models.filter((model) => model.sources.some((source) => source.api_key_hash === selectedHash))
+    : models
+  return filtered.map((model) => ({
+    label: modelOptionLabel(model),
+    value: model.id,
+  }))
+})
+const requestTestReplyText = computed(() => {
+  const reply = requestTestResult.value?.reply?.trim()
+  return reply || '模型返回成功，但没有可展示文本。'
+})
+const requestTestUsageText = computed(() => {
+  const usage = requestTestResult.value?.usage
+  if (!usage) {
+    return ''
+  }
+  const input = numberFromUsage(usage.prompt_tokens ?? usage.input_tokens)
+  const output = numberFromUsage(usage.completion_tokens ?? usage.output_tokens)
+  const total = numberFromUsage(usage.total_tokens)
+  const parts: string[] = []
+  if (input !== null) {
+    parts.push(`输入 ${formatInteger(input)}`)
+  }
+  if (output !== null) {
+    parts.push(`输出 ${formatInteger(output)}`)
+  }
+  if (total !== null) {
+    parts.push(`总计 ${formatInteger(total)}`)
+  }
+  return parts.join(' / ')
+})
+
+watch(requestEndpoint, () => {
+  requestTestResult.value = null
+  requestTestError.value = null
+})
+
+function requestBodyForEndpoint(
+  endpoint: ModelRequestEndpoint,
+  model: string,
+  content: string,
+): Record<string, unknown> {
+  if (endpoint === 'responses') {
+    return {
+      model,
+      input: content,
+      stream: false,
+    }
+  }
+  if (endpoint === 'claude_messages') {
+    return {
+      model,
+      max_tokens: 1024,
+      messages: [{ role: 'user', content }],
+    }
+  }
+  return {
+    model,
+    messages: [{ role: 'user', content }],
+    stream: false,
+  }
+}
+
+function quoteForCurl(value: string): string {
+  return "'" + value.replace(/'/g, "'\"'\"'") + "'"
+}
+
+function quotaValueText(quota: UserQuotaStatus | null): string {
+  if (!quota) {
+    return '加载中'
+  }
+  if (quota.unlimited) {
+    return '每月余额 无限制'
+  }
+  return `每月余额 ${formatUsd(quota.monthly_remaining_usd ?? 0)}`
+}
+
+function quotaFootnote(quota: UserQuotaStatus | null): string {
+  if (!quota) {
+    return '额度加载中'
+  }
+  if (quota.unlimited) {
+    return '不限时余额 无限制'
+  }
+  const lifetimeText = `不限时余额 ${formatUsd(quota.lifetime_remaining_usd ?? 0)}`
+  const notes: string[] = []
+  if (quota.sync_error) {
+    notes.push('Key 同步异常')
+  }
+  if (quota.unpriced_records > 0) {
+    notes.push(`未定价 ${formatInteger(quota.unpriced_records)} 条`)
+  }
+  if (quota.paused) {
+    notes.push('Key 已因余额暂停')
+  }
+  return notes.length > 0 ? `${lifetimeText} · ${notes.join(' · ')}` : lifetimeText
+}
+
+function modelOptionLabel(model: AvailableModel): string {
+  return model.id
+}
+
+function numberFromUsage(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return null
+  }
+  return value
+}
+
+function ensureRequestTestModel() {
+  const options = requestTestModelOptions.value
+  if (options.length === 0) {
+    requestTestModel.value = null
+    return
+  }
+  if (!requestTestModel.value || !options.some((option) => option.value === requestTestModel.value)) {
+    const firstOption = options[0]
+    requestTestModel.value = firstOption ? firstOption.value : null
+  }
+}
 
 function displayedApiKey(row: UserApiKeySummary): string {
   if (row.api_key && isApiKeyVisible(row)) {
@@ -162,7 +404,91 @@ async function copyGeneratedApiKey() {
   }
 }
 
+async function loadModelRequestGuide() {
+  try {
+    modelRequestGuide.value = await getModelRequestGuide()
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '加载请求地址失败')
+  }
+}
+
+async function loadAvailableModelsForTest() {
+  isAvailableModelsLoading.value = true
+  try {
+    availableModels.value = await listAvailableModels()
+    ensureRequestTestModel()
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '加载可用模型失败')
+  } finally {
+    isAvailableModelsLoading.value = false
+  }
+}
+
+function openRequestTest(row: UserApiKeySummary) {
+  requestTestApiKey.value = row
+  requestTestModel.value = row.last_model ?? row.models[0] ?? null
+  requestTestResult.value = null
+  requestTestError.value = null
+  requestTestVisible.value = true
+  if (!modelRequestGuide.value) {
+    void loadModelRequestGuide()
+  }
+  if (!availableModels.value) {
+    void loadAvailableModelsForTest()
+  } else {
+    ensureRequestTestModel()
+  }
+}
+
+async function copyRequestValue(label: string, value: string) {
+  if (!value || value === requestLoadingText) {
+    return
+  }
+  try {
+    await copyToClipboard(value)
+    message.success(`${label} 已复制`)
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '复制失败')
+  }
+}
+
+async function runRequestTest() {
+  if (isRequestTesting.value) {
+    return
+  }
+  const currentKey = requestTestApiKey.value
+  const model = requestTestModel.value?.trim() ?? ''
+  if (!currentKey) {
+    message.error('请选择要测试的 API KEY')
+    return
+  }
+  if (!model) {
+    message.error('请选择测试模型')
+    return
+  }
+  isRequestTesting.value = true
+  requestTestResult.value = null
+  requestTestError.value = null
+  try {
+    requestTestResult.value = await testModelRequest({
+      api_key_hash: currentKey.api_key_hash,
+      endpoint: requestEndpoint.value,
+      model,
+      message: requestTestMessage.value,
+    })
+    message.success('请求测试完成')
+  } catch (error) {
+    requestTestError.value = error instanceof Error ? error.message : '请求测试失败'
+  } finally {
+    isRequestTesting.value = false
+  }
+}
+
 function openCreateDialog() {
+  if (!canCreateApiKey.value) {
+    message.error('当前账号额度已用尽，API KEY 已暂停')
+    return
+  }
   editingApiKeyHash.value = null
   apiKeyDescription.value = 'VSCode'
   generatedApiKey.value = null
@@ -186,12 +512,16 @@ function editApiKey(row: UserApiKeySummary) {
 async function refresh() {
   isLoading.value = true
   try {
-    const [nextApiKeys, overview] = await Promise.all([
+    const [nextApiKeys, overview, quota, guide] = await Promise.all([
       listApiKeys(),
       getUsageOverview({ scope: 'account' }),
+      getCurrentUserQuota(),
+      getModelRequestGuide(),
     ])
     apiKeys.value = nextApiKeys
     usageSummary.value = overview.summary
+    quotaStatus.value = quota
+    modelRequestGuide.value = guide
     if (editingApiKeyHash.value) {
       const current = apiKeys.value.find((item) => item.api_key_hash === editingApiKeyHash.value)
       if (!current) {
@@ -221,6 +551,10 @@ async function saveApiKey() {
       await updateApiKey(editingApiKeyHash.value, { description })
       message.success('API 密钥已更新')
     } else {
+      if (!canCreateApiKey.value) {
+        message.error('当前账号额度已用尽，API KEY 已暂停')
+        return
+      }
       const created = await createApiKey({ description })
       generatedApiKey.value = created.api_key ?? null
       generatedApiKeyHash.value = created.api_key_hash
@@ -312,11 +646,19 @@ const columns: DataTableColumns<UserApiKeySummary> = [
   {
     title: '',
     key: 'actions',
-    width: 130,
+    width: 230,
     fixed: 'right',
     render: (row) =>
       h(NSpace, { size: 4 }, {
         default: () => [
+          h(
+            NButton,
+            { size: 'small', quaternary: true, onClick: () => openRequestTest(row) },
+            {
+              icon: () => h(NIcon, { component: Send }),
+              default: () => '请求测试',
+            },
+          ),
           h(
             NButton,
             { size: 'small', quaternary: true, onClick: () => editApiKey(row) },
@@ -344,7 +686,9 @@ onMounted(refresh)
       </div>
       <NSpace>
         <NButton secondary :loading="isLoading" @click="refresh">刷新</NButton>
-        <NButton type="primary" @click="openCreateDialog">新建 API 密钥</NButton>
+        <NButton type="primary" :disabled="!canCreateApiKey" @click="openCreateDialog">
+          新建 API 密钥
+        </NButton>
       </NSpace>
     </div>
 
@@ -367,6 +711,13 @@ onMounted(refresh)
           密钥拥有当前账号的完整权限，请妥善保管。
         </NAlert>
 
+        <NAlert v-if="quotaStatus?.paused" type="error" :bordered="false" title="额度已用尽">
+          当前账号 API KEY 已从 CPA 暂停。补充额度或进入新月份恢复月额度后，系统会自动恢复可用 Key。
+        </NAlert>
+        <NAlert v-else-if="quotaStatus?.unpriced_records" type="warning" :bordered="false">
+          当前账号存在 {{ formatInteger(quotaStatus.unpriced_records) }} 条未定价用量，未计入额度扣减。
+        </NAlert>
+
         <div v-if="generatedApiKey" class="generated-key-box">
           <div class="generated-key-main">
             <div class="generated-key-title">新创建的密钥</div>
@@ -386,7 +737,7 @@ onMounted(refresh)
           :data="apiKeys"
           :pagination="{ pageSize: 12 }"
           table-layout="fixed"
-          :scroll-x="980"
+          :scroll-x="1080"
         />
       </div>
     </section>
@@ -410,11 +761,157 @@ onMounted(refresh)
         </NFormItem>
         <div class="modal-actions">
           <NButton secondary :disabled="isSaving" @click="editorVisible = false">取消</NButton>
-          <NButton type="primary" :loading="isSaving" :disabled="isSaving" @click="saveApiKey">
+          <NButton
+            type="primary"
+            :loading="isSaving"
+            :disabled="isSaving || (!editingApiKeyHash && !canCreateApiKey)"
+            @click="saveApiKey"
+          >
             {{ editingApiKeyHash ? '保存' : '创建' }}
           </NButton>
         </div>
       </NForm>
+    </NModal>
+
+    <NModal
+      v-model:show="requestTestVisible"
+      preset="card"
+      title="请求测试"
+      :style="{ width: 'min(760px, calc(100vw - 32px))' }"
+    >
+      <div class="request-test">
+        <NAlert type="info" :bordered="false">
+          这里提供当前 API KEY 的请求说明，也可以直接选择模型发起一次真实测试。
+        </NAlert>
+
+        <div class="request-endpoint-switch">
+          <span class="request-endpoint-label">请求格式</span>
+          <NRadioGroup v-model:value="requestEndpoint" size="small">
+            <NRadioButton
+              v-for="option in requestEndpointOptions"
+              :key="option.value"
+              :value="option.value"
+            >
+              {{ option.label }}
+            </NRadioButton>
+          </NRadioGroup>
+        </div>
+
+        <div class="request-guide-list">
+          <div class="request-guide-row">
+            <div>
+              <div class="request-guide-label">Base URL</div>
+              <code class="request-guide-value">{{ requestBaseURL }}</code>
+            </div>
+            <NButton size="small" secondary @click="copyRequestValue('Base URL', requestBaseURL)">
+              <template #icon>
+                <NIcon :component="Copy" />
+              </template>
+              复制
+            </NButton>
+          </div>
+          <div class="request-guide-row">
+            <div>
+              <div class="request-guide-label">{{ requestEndpointURLLabel }}</div>
+              <code class="request-guide-value">{{ requestEndpointURL }}</code>
+            </div>
+            <NButton size="small" secondary @click="copyRequestValue('请求 URL', requestEndpointURL)">
+              <template #icon>
+                <NIcon :component="Copy" />
+              </template>
+              复制
+            </NButton>
+          </div>
+          <div class="request-guide-row">
+            <div>
+              <div class="request-guide-label">Header</div>
+              <code class="request-guide-value request-guide-value-multiline">{{ requestHeadersText }}</code>
+            </div>
+            <NButton size="small" secondary @click="copyRequestValue('Header', requestHeadersText)">
+              <template #icon>
+                <NIcon :component="Copy" />
+              </template>
+              复制
+            </NButton>
+          </div>
+        </div>
+
+        <div class="request-example">
+          <div class="request-example-head">
+            <span>curl 示例</span>
+            <NButton size="small" secondary @click="copyRequestValue('curl 示例', sampleRequest)">
+              <template #icon>
+                <NIcon :component="Copy" />
+              </template>
+              复制示例
+            </NButton>
+          </div>
+          <pre>{{ sampleRequest }}</pre>
+        </div>
+
+        <div class="request-test-section-title">请求测试</div>
+
+        <NForm label-placement="top" class="request-test-form">
+          <NFormItem label="测试模型">
+            <NSelect
+              v-model:value="requestTestModel"
+              filterable
+              clearable
+              :loading="isAvailableModelsLoading"
+              :options="requestTestModelOptions"
+              placeholder="选择当前 Key 可用的模型"
+            />
+          </NFormItem>
+          <NFormItem label="测试消息">
+            <NInput
+              v-model:value="requestTestMessage"
+              type="textarea"
+              :autosize="{ minRows: 3, maxRows: 5 }"
+              placeholder="输入要发送给模型的测试消息"
+            />
+          </NFormItem>
+        </NForm>
+
+        <NAlert
+          v-if="!isAvailableModelsLoading && requestTestModelOptions.length === 0"
+          type="warning"
+          :bordered="false"
+        >
+          当前 Key 暂未查询到可选模型，可以先刷新模型列表，或到「可用模型」页面检查 Key 是否可用。
+        </NAlert>
+
+        <div class="modal-actions request-test-actions">
+          <NButton secondary :loading="isAvailableModelsLoading" @click="loadAvailableModelsForTest">
+            刷新模型
+          </NButton>
+          <NButton
+            type="primary"
+            :loading="isRequestTesting"
+            :disabled="!requestTestModel || isAvailableModelsLoading"
+            @click="runRequestTest"
+          >
+            <template #icon>
+              <NIcon :component="Send" />
+            </template>
+            发送测试
+          </NButton>
+        </div>
+
+        <NAlert v-if="requestTestError" type="error" :bordered="false">
+          {{ requestTestError }}
+        </NAlert>
+
+        <div v-if="requestTestResult" class="request-test-result">
+          <div class="request-test-result-head">
+            <span>模型回复</span>
+            <span>
+              HTTP {{ requestTestResult.status_code }} · {{ requestTestResult.duration_ms }}ms
+              <template v-if="requestTestUsageText"> · {{ requestTestUsageText }}</template>
+            </span>
+          </div>
+          <pre>{{ requestTestReplyText }}</pre>
+        </div>
+      </div>
     </NModal>
   </section>
 </template>
@@ -427,7 +924,7 @@ onMounted(refresh)
 }
 
 .api-key-metrics {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
 }
 
 .api-key-panel-shell,
@@ -473,6 +970,156 @@ onMounted(refresh)
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.request-test {
+  display: grid;
+  gap: 14px;
+}
+
+.request-endpoint-switch {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px 12px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--cpa-border);
+  border-radius: var(--cpa-radius);
+  background: var(--cpa-surface-muted);
+}
+
+.request-endpoint-label {
+  color: var(--cpa-text-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.request-guide-list {
+  display: grid;
+  overflow: hidden;
+  border: 1px solid var(--cpa-border);
+  border-radius: var(--cpa-radius);
+  background: var(--cpa-surface);
+}
+
+.request-guide-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--cpa-border);
+}
+
+.request-guide-row:last-child {
+  border-bottom: 0;
+}
+
+.request-guide-label {
+  margin-bottom: 4px;
+  color: var(--cpa-text-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.request-guide-value {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--cpa-text);
+  font-family: Consolas, 'SFMono-Regular', 'Microsoft YaHei UI', monospace;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.request-guide-value-multiline {
+  white-space: pre-wrap;
+}
+
+.request-example,
+.request-test-form {
+  display: grid;
+}
+
+.request-example {
+  overflow: hidden;
+  border: 1px solid var(--cpa-border);
+  border-radius: var(--cpa-radius);
+  background: var(--cpa-surface);
+}
+
+.request-example-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--cpa-border);
+  font-weight: 700;
+}
+
+.request-example pre {
+  overflow: auto;
+  margin: 0;
+  padding: 14px;
+  background: var(--cpa-surface-muted);
+  color: var(--cpa-text);
+  font-family: Consolas, 'SFMono-Regular', 'Microsoft YaHei UI', monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.request-test-section-title {
+  color: var(--cpa-text);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.request-test-form {
+  gap: 2px;
+}
+
+.request-test-actions {
+  align-items: center;
+}
+
+.request-test-result {
+  overflow: hidden;
+  border: 1px solid var(--cpa-border);
+  border-radius: var(--cpa-radius);
+  background: var(--cpa-surface);
+}
+
+.request-test-result-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--cpa-border);
+  font-weight: 700;
+}
+
+.request-test-result-head span:last-child {
+  color: var(--cpa-text-muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.request-test-result pre {
+  overflow: auto;
+  margin: 0;
+  padding: 14px;
+  background: var(--cpa-surface-muted);
+  color: var(--cpa-text);
+  font-family: Consolas, 'SFMono-Regular', 'Microsoft YaHei UI', monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
 }
 
 :global(.api-key-cell) {
@@ -559,6 +1206,16 @@ onMounted(refresh)
   }
 
   .generated-key-box {
+    flex-direction: column;
+  }
+
+  .request-guide-row {
+    grid-template-columns: 1fr;
+  }
+
+  .request-example-head,
+  .request-test-result-head {
+    align-items: flex-start;
     flex-direction: column;
   }
 }

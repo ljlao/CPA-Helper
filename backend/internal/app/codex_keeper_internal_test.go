@@ -121,6 +121,13 @@ func TestConditionalKeeperRefreshCandidatesUseUsageQuotaAndCache(t *testing.T) {
 					{"name": "remote-detail-email.json", "type": "codex"},
 					{"name": "remote-short-index.json", "type": "codex"},
 					{"name": "remote-list-email.json", "type": "codex", "email": "list@example.com"},
+					{"name": "email-match.json", "type": "codex"},
+					{"name": "source-match.json", "type": "codex"},
+					{"name": "cached-request.json", "type": "codex"},
+					{"name": "cached-email.json", "type": "codex"},
+					{"name": "quota-due.json", "type": "codex"},
+					{"name": "quota-future.json", "type": "codex"},
+					{"name": "quota-cached.json", "type": "codex"},
 				},
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
@@ -172,6 +179,57 @@ func TestConditionalKeeperRefreshCandidatesUseUsageQuotaAndCache(t *testing.T) {
 		"remote-short-index.json",
 		"quota-due.json",
 	})
+}
+
+func TestConditionalKeeperRefreshCandidatesReconcileRemoteAuthStates(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"files": []map[string]any{
+					{"name": "kept.json", "type": "codex"},
+					{"name": "new-remote.json", "type": "codex"},
+					{"name": "not-codex.json", "type": "other"},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
+	cfg.CodexKeeper.AccountRefreshCacheMinutes = 10
+
+	insertKeeperStateForCandidate(t, app, "kept.json", nil, nil)
+	insertKeeperStateForCandidate(t, app, "stale-local.json", nil, nil)
+
+	names, err := app.conditionalKeeperRefreshCandidates(ctx, cfg)
+	if err != nil {
+		t.Fatalf("conditionalKeeperRefreshCandidates: %v", err)
+	}
+	assertStringSet(t, names, []string{"new-remote.json"})
+	if got := countKeeperRows(t, app, `SELECT COUNT(*) FROM codex_keeper_auth_states WHERE auth_name = 'kept.json'`); got != 1 {
+		t.Fatalf("kept state rows = %d, want 1", got)
+	}
+	if got := countKeeperRows(t, app, `SELECT COUNT(*) FROM codex_keeper_auth_states WHERE auth_name = 'stale-local.json'`); got != 0 {
+		t.Fatalf("stale state rows = %d, want 0", got)
+	}
 }
 
 func TestKeeperQuotaWindowUsageAttributionPrefersSourceAccount(t *testing.T) {

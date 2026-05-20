@@ -27,15 +27,19 @@ type AvailableModelSource struct {
 	APIKeyHash    string `json:"api_key_hash"`
 	APIKeyPreview string `json:"api_key_preview"`
 	Description   string `json:"description"`
+	UserID        *int   `json:"user_id,omitempty"`
+	UserLabel     string `json:"user_label,omitempty"`
 }
 
 type AvailableModelPrice struct {
-	Provider                   string  `json:"provider"`
-	Model                      string  `json:"model"`
-	InputUSDPerMillion         float64 `json:"input_usd_per_million"`
-	OutputUSDPerMillion        float64 `json:"output_usd_per_million"`
-	CacheReadUSDPerMillion     float64 `json:"cache_read_usd_per_million"`
-	CacheCreationUSDPerMillion float64 `json:"cache_creation_usd_per_million"`
+	Provider                   string   `json:"provider"`
+	Model                      string   `json:"model"`
+	InputUSDPerMillion         float64  `json:"input_usd_per_million"`
+	OutputUSDPerMillion        float64  `json:"output_usd_per_million"`
+	CacheReadUSDPerMillion     float64  `json:"cache_read_usd_per_million"`
+	CacheCreationUSDPerMillion float64  `json:"cache_creation_usd_per_million"`
+	RequestUSD                 *float64 `json:"request_usd"`
+	BillingUnit                string   `json:"billing_unit"`
 }
 
 type AvailableModelItem struct {
@@ -158,6 +162,8 @@ func (a *App) availableModelsForUser(ctx context.Context, userID int) (Available
 				OutputUSDPerMillion:        price.OutputUSDPerMillion,
 				CacheReadUSDPerMillion:     price.CacheReadUSDPerMillion,
 				CacheCreationUSDPerMillion: price.CacheCreationUSDPerMillion,
+				RequestUSD:                 price.RequestUSD,
+				BillingUnit:                price.BillingUnit,
 			}
 		}
 		response.Models = append(response.Models, model)
