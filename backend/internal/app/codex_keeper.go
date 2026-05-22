@@ -1669,7 +1669,7 @@ func (a *App) executeKeeperRunWithOptions(ctx context.Context, options keeperRun
 	if options.Mode == "conditional" {
 		detail = fmt.Sprintf("条件刷新完成：健康 %d，坏凭证禁用 %d，优先级降级 %d，优先级恢复 %d，网络错误 %d，缓存跳过 %d", stats.Healthy, stats.StatusDisabled, stats.PriorityDegraded, stats.PriorityRestored, stats.NetworkError, stats.Skipped)
 	} else if len(targetSet) > 0 {
-		detail = fmt.Sprintf("账号刷新完成：健康 %d，凭证异常 %d，网络错误 %d", stats.Healthy, stats.StatusDisabled, stats.NetworkError)
+		detail = fmt.Sprintf("账号刷新完成：健康 %d，凭证异常 %d，优先级降级 %d，优先级恢复 %d，网络错误 %d", stats.Healthy, stats.StatusDisabled, stats.PriorityDegraded, stats.PriorityRestored, stats.NetworkError)
 	} else {
 		detail = fmt.Sprintf("巡检完成：健康 %d，坏凭证禁用 %d，优先级降级 %d，网络错误 %d，缓存跳过 %d", stats.Healthy, stats.StatusDisabled, stats.PriorityDegraded, stats.NetworkError, stats.Skipped)
 	}
@@ -2354,19 +2354,6 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	result.QuotaThreshold = &cfg.CodexKeeper.QuotaThreshold
 	result.Result = "healthy"
 
-	if manualRefresh {
-		accountType := "unknown"
-		if result.AccountType != nil && strings.TrimSpace(*result.AccountType) != "" {
-			accountType = *result.AccountType
-		}
-		action := fmt.Sprintf("刷新完成，类型 %s", accountType)
-		result.LatestAction = &action
-		result.LastError = nil
-		_ = a.upsertKeeperState(ctx, result)
-		logFn(name + ": " + action)
-		return result
-	}
-
 	var restorePriority *int
 	if state, err := a.getKeeperState(ctx, name); err == nil {
 		restorePriority = state.RestorePriority
@@ -2390,7 +2377,13 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		if result.AccountType != nil && strings.TrimSpace(*result.AccountType) != "" {
 			accountType = *result.AccountType
 		}
-		logFn(fmt.Sprintf("%s: 巡检正常，类型 %s", name, accountType))
+		if manualRefresh {
+			action := fmt.Sprintf("刷新完成，类型 %s", accountType)
+			result.LatestAction = &action
+			logFn(name + ": " + action)
+		} else {
+			logFn(fmt.Sprintf("%s: 巡检正常，类型 %s", name, accountType))
+		}
 	}
 	if result.Priority == nil || *result.Priority != -1 {
 		result.ClearRestorePriority = true

@@ -569,7 +569,7 @@ func TestKeeperRefreshAccountsOnlyProcessesSelectedAuths(t *testing.T) {
 	}
 }
 
-func TestKeeperRefreshAccountsDisablesBadCredential(t *testing.T) {
+func TestKeeperRefreshAccountsDisablesBadCredentialAndAppliesPriorityPolicy(t *testing.T) {
 	dataDir := t.TempDir()
 	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
 
@@ -707,8 +707,8 @@ func TestKeeperRefreshAccountsDisablesBadCredential(t *testing.T) {
 	}
 
 	quota := items["quota-high.json"]
-	if quota.Priority == nil || *quota.Priority != 0 {
-		t.Fatalf("quota-high priority = %v, want unchanged 0", quota.Priority)
+	if quota.Priority == nil || *quota.Priority != -1 {
+		t.Fatalf("quota-high priority = %v, want -1", quota.Priority)
 	}
 	if quota.LastError != nil {
 		t.Fatalf("quota-high last_error = %v, want nil", *quota.LastError)
@@ -732,8 +732,8 @@ func TestKeeperRefreshAccountsDisablesBadCredential(t *testing.T) {
 	if statusPatchCount != 1 {
 		t.Fatalf("status patch count = %d, want 1", statusPatchCount)
 	}
-	if priorityPatchCount != 1 {
-		t.Fatalf("priority patch count = %d, want 1", priorityPatchCount)
+	if priorityPatchCount != 2 {
+		t.Fatalf("priority patch count = %d, want 2", priorityPatchCount)
 	}
 }
 

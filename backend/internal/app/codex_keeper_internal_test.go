@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -875,6 +876,142 @@ func TestConditionalKeeperRunUsesAutomaticPriorityPolicy(t *testing.T) {
 	}
 	if got := countKeeperRows(t, app, `SELECT COUNT(*) FROM codex_keeper_runs`); got != 0 {
 		t.Fatalf("keeper run rows = %d, want 0 because conditional refresh is not persisted", got)
+	}
+}
+
+func TestManualKeeperRefreshUsesAutomaticPriorityPolicy(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	authDetails := map[string]map[string]any{
+		"quota.json": {
+			"name":         "quota.json",
+			"type":         "codex",
+			"account_type": "free",
+			"disabled":     false,
+			"priority":     0,
+			"access_token": "test-token",
+		},
+		"default.json": {
+			"name":         "default.json",
+			"type":         "codex",
+			"account_type": "plus",
+			"disabled":     false,
+			"priority":     0,
+			"access_token": "test-token",
+		},
+		"restore.json": {
+			"name":         "restore.json",
+			"type":         "codex",
+			"account_type": "plus",
+			"disabled":     false,
+			"priority":     -1,
+			"access_token": "test-token",
+		},
+	}
+	usagePercents := map[string]int{
+		"quota.json":   100,
+		"default.json": 10,
+		"restore.json": 10,
+	}
+	priorityPatches := map[string][]int{}
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"files": []map[string]any{
+					{"name": "quota.json", "type": "codex"},
+					{"name": "default.json", "type": "codex"},
+					{"name": "restore.json", "type": "codex"},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			detail, ok := authDetails[r.URL.Query().Get("name")]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(detail)
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			var payload struct {
+				AuthIndex string `json:"auth_index"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			usedPercent := usagePercents[payload.AuthIndex]
+			planType, _ := authDetails[payload.AuthIndex]["account_type"].(string)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status_code": 200,
+				"body": map[string]any{
+					"plan_type": planType,
+					"rate_limit": map[string]any{
+						"primary_window": map[string]any{
+							"used_percent":        usedPercent,
+							"reset_after_seconds": 3600,
+						},
+					},
+				},
+			})
+		case r.Method == http.MethodPatch && r.URL.Path == "/v0/management/auth-files/fields":
+			var payload struct {
+				Name     string `json:"name"`
+				Priority *int   `json:"priority"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if payload.Priority == nil {
+				http.Error(w, "priority is required", http.StatusBadRequest)
+				return
+			}
+			priorityPatches[payload.Name] = append(priorityPatches[payload.Name], *payload.Priority)
+			authDetails[payload.Name]["priority"] = *payload.Priority
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, func(cfg *AppConfig) {
+		cfg.CodexKeeper.DryRun = false
+		cfg.CodexKeeper.QuotaThreshold = 50
+	})
+	insertKeeperStateForCandidate(t, app, "restore.json", nil, nil)
+	_, err = app.db.Exec(`
+		UPDATE codex_keeper_auth_states
+		SET restore_priority = ?, updated_at = ?
+		WHERE auth_name = ?
+	`, 21, dbTime(time.Now().In(appTimeLocation)), "restore.json")
+	if err != nil {
+		t.Fatalf("seed restore priority: %v", err)
+	}
+
+	stats, _, err := app.executeKeeperRunForAccounts(context.Background(), "accounts", []string{"quota.json", "default.json", "restore.json"}, func(string) {})
+	if err != nil {
+		t.Fatalf("manual refresh: %v", err)
+	}
+	if stats.PriorityDegraded != 1 {
+		t.Fatalf("priority_degraded = %d, want 1", stats.PriorityDegraded)
+	}
+	if stats.PriorityRestored != 2 {
+		t.Fatalf("priority_restored = %d, want 2", stats.PriorityRestored)
+	}
+	expectedPatches := map[string][]int{
+		"quota.json":   {-1},
+		"default.json": {4},
+		"restore.json": {21},
+	}
+	if !reflect.DeepEqual(priorityPatches, expectedPatches) {
+		t.Fatalf("priority patches = %#v, want %#v", priorityPatches, expectedPatches)
+	}
+	if got := countKeeperRows(t, app, `SELECT COUNT(*) FROM codex_keeper_runs`); got != 0 {
+		t.Fatalf("keeper run rows = %d, want 0 because account refresh is not persisted", got)
 	}
 }
 
