@@ -1619,17 +1619,24 @@ func insertKeeperUsageRecord(t *testing.T, app *App, dedupe string, timestamp ti
 	if value := rawJSONStringField(rawJSON, "source"); value != nil {
 		source = *value
 	}
-	_, err := app.db.Exec(`
+	result, err := app.db.Exec(`
 		INSERT INTO usage_records (
 			created_at, timestamp, usage_username, api_key_description, provider,
 			model, endpoint, source, request_id, auth, latency_ms, failed,
 			input_tokens, output_tokens, cached_tokens, reasoning_tokens,
-			total_tokens, dedupe_key, raw_json
+			total_tokens, dedupe_key
 		) VALUES (?, ?, NULL, NULL, 'codex', 'gpt-test', '/v1/responses',
-			?, ?, 'api_key', 10, 1, 1, 1, 0, 0, 2, ?, ?)
-	`, now, dbTime(timestamp), source, dedupe, "conditional-"+dedupe, rawJSON)
+			?, ?, 'api_key', 10, 1, 1, 1, 0, 0, 2, ?)
+	`, now, dbTime(timestamp), source, dedupe, "conditional-"+dedupe)
 	if err != nil {
 		t.Fatalf("insert usage record %s: %v", dedupe, err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("usage record id %s: %v", dedupe, err)
+	}
+	if _, err := app.db.Exec(`INSERT INTO usage_record_payloads (usage_record_id, raw_json, created_at) VALUES (?, ?, ?)`, id, rawJSON, now); err != nil {
+		t.Fatalf("insert usage payload %s: %v", dedupe, err)
 	}
 }
 
@@ -1660,17 +1667,24 @@ func insertKeeperWindowUsageRecord(t *testing.T, app *App, seed keeperWindowUsag
 	inputTokens := seed.InputTokens
 	outputTokens := seed.OutputTokens
 	totalTokens := inputTokens + outputTokens
-	_, err := app.db.Exec(`
+	result, err := app.db.Exec(`
 		INSERT INTO usage_records (
 			created_at, timestamp, usage_username, api_key_description, provider,
 			model, endpoint, source, source_account, request_id, auth, auth_index, latency_ms,
 			failed, input_tokens, output_tokens, cached_tokens, reasoning_tokens,
-			total_tokens, dedupe_key, raw_json
+			total_tokens, dedupe_key
 		) VALUES (?, ?, NULL, NULL, 'codex', 'gpt-test', '/v1/responses',
-			?, ?, ?, 'api_key', ?, 10, ?, ?, ?, 0, 0, ?, ?, ?)
-	`, now, dbTime(seed.Timestamp), source, nullableTestString(sourceAccount), seed.Dedupe, nullableBlankTestString(authIndex), seed.Failed, inputTokens, outputTokens, totalTokens, "quota-"+seed.Dedupe, rawJSON)
+			?, ?, ?, 'api_key', ?, 10, ?, ?, ?, 0, 0, ?, ?)
+	`, now, dbTime(seed.Timestamp), source, nullableTestString(sourceAccount), seed.Dedupe, nullableBlankTestString(authIndex), seed.Failed, inputTokens, outputTokens, totalTokens, "quota-"+seed.Dedupe)
 	if err != nil {
 		t.Fatalf("insert quota usage record %s: %v", seed.Dedupe, err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("quota usage record id %s: %v", seed.Dedupe, err)
+	}
+	if _, err := app.db.Exec(`INSERT INTO usage_record_payloads (usage_record_id, raw_json, created_at) VALUES (?, ?, ?)`, id, rawJSON, now); err != nil {
+		t.Fatalf("insert quota usage payload %s: %v", seed.Dedupe, err)
 	}
 }
 

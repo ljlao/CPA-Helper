@@ -53,8 +53,14 @@ export function getUsageDistributions(
   return apiClient.get<UsageDistributionsResponse>('/usage/distributions', filtersToParams(filters))
 }
 
-export function getUsageOverview(filters: UsageFilters): Promise<UsageOverviewResponse> {
-  return apiClient.get<UsageOverviewResponse>('/usage/overview', filtersToParams(filters))
+export function getUsageOverview(
+  filters: UsageFilters,
+  options: { includeOptions?: boolean } = {},
+): Promise<UsageOverviewResponse> {
+  return apiClient.get<UsageOverviewResponse>('/usage/overview', {
+    ...filtersToParams(filters),
+    include_options: options.includeOptions,
+  })
 }
 
 export function getUsageRecords(

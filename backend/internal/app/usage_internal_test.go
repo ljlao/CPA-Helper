@@ -61,3 +61,53 @@ func TestSaveUsageMessageIgnoresZeroTTFT(t *testing.T) {
 		t.Fatalf("stored ttft_ms = %v, want NULL", ttftMS.Float64)
 	}
 }
+
+func TestFilteredUsageRecordsForStatsSkipsRawJSON(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	raw := `{"api_key":"sk-usage-stats-raw","timestamp":"2026-05-31T10:00:00+08:00","provider":"openai","model":"gpt-5.5","request_id":"usage-stats-raw","input_tokens":10,"output_tokens":2}`
+	record, created, err := app.saveUsageMessage(context.Background(), []byte(raw))
+	if err != nil || !created {
+		t.Fatalf("saveUsageMessage created=%v err=%v", created, err)
+	}
+	if record.RawJSON == "" {
+		t.Fatal("saved record raw_json is empty")
+	}
+
+	start, err := parseQueryTime("2026-05-31T00:00:00+08:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	end, err := parseQueryTime("2026-06-01T00:00:00+08:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	filters := UsageFilters{Start: &start, End: &end}
+
+	statsRecords, err := app.filteredUsageRecordsForStats(context.Background(), filters, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statsRecords) != 1 {
+		t.Fatalf("stats record count = %d, want 1", len(statsRecords))
+	}
+	if statsRecords[0].RawJSON != "" {
+		t.Fatalf("stats raw_json = %q, want empty lightweight projection", statsRecords[0].RawJSON)
+	}
+
+	fullRecords, err := app.filteredUsageRecords(context.Background(), filters, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fullRecords) != 1 {
+		t.Fatalf("full record count = %d, want 1", len(fullRecords))
+	}
+	if fullRecords[0].RawJSON == "" {
+		t.Fatal("full raw_json is empty, want detail projection to keep raw_json")
+	}
+}

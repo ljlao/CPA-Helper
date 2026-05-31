@@ -655,16 +655,22 @@ func seedUsageRecordWithValues(t *testing.T, dataDir string, seed usageRecordSee
 		INSERT INTO usage_records (
 			created_at, timestamp, usage_username, api_key_description, provider, model,
 			reasoning_effort, endpoint, source, request_id, auth, latency_ms, ttft_ms, failed, input_tokens,
-			output_tokens, cached_tokens, reasoning_tokens, total_tokens, dedupe_key, raw_json
+			output_tokens, cached_tokens, reasoning_tokens, total_tokens, dedupe_key
 		) VALUES (
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1000, ?, 0, ?, ?, 0, 0, ?, ?, ?
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1000, ?, 0, ?, ?, 0, 0, ?, ?
 		)
-	`, seed.Timestamp, seed.Timestamp, seed.Username, description, provider, model, nullableSeedString(seed.ReasoningEffort), endpoint, seed.Source, seed.RequestID, seed.Auth, nullableSeedFloat(seed.TTFTMS), seed.InputTokens, seed.OutputTokens, seed.TotalTokens, seed.DedupeKey, seed.RawJSON)
+	`, seed.Timestamp, seed.Timestamp, seed.Username, description, provider, model, nullableSeedString(seed.ReasoningEffort), endpoint, seed.Source, seed.RequestID, seed.Auth, nullableSeedFloat(seed.TTFTMS), seed.InputTokens, seed.OutputTokens, seed.TotalTokens, seed.DedupeKey)
 	if err != nil {
 		t.Fatal(err)
 	}
 	id, err := result.LastInsertId()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO usage_record_payloads (usage_record_id, raw_json, created_at)
+		VALUES (?, ?, ?)
+	`, id, valueOrDefault(seed.RawJSON, "{}"), seed.Timestamp); err != nil {
 		t.Fatal(err)
 	}
 	return int(id)
@@ -711,7 +717,12 @@ func storedUsageSourceAndRawJSON(t *testing.T, dataDir string, id int) (string, 
 	defer db.Close()
 
 	var source, rawJSON string
-	if err := db.QueryRow(`SELECT source, raw_json FROM usage_records WHERE id = ?`, id).Scan(&source, &rawJSON); err != nil {
+	if err := db.QueryRow(`
+		SELECT usage_records.source, usage_record_payloads.raw_json
+		FROM usage_records
+		JOIN usage_record_payloads ON usage_record_payloads.usage_record_id = usage_records.id
+		WHERE usage_records.id = ?
+	`, id).Scan(&source, &rawJSON); err != nil {
 		t.Fatal(err)
 	}
 	return source, rawJSON

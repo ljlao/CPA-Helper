@@ -502,14 +502,14 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
             ...filters,
             start: formatLocalDateTimeParam(realtimeStart),
             end: formatLocalDateTimeParam(realtimeEnd),
-          })
+          }, { includeOptions: false })
         : Promise.resolve(null)
     const quotaRequest = isAccountScope.value ? getCurrentUserQuota() : Promise.resolve(null)
     const [overviewResult, todayResult, failedResult, realtimeResult, quotaResult] =
       await Promise.allSettled([
         getUsageOverview(filters),
-        getUsageOverview(todayFilters),
-        getUsageOverview(failedFilters),
+        getUsageOverview(todayFilters, { includeOptions: false }),
+        getUsageOverview(failedFilters, { includeOptions: false }),
         realtimeRequest,
         quotaRequest,
       ] as const)

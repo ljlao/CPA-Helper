@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -33,6 +34,12 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	}
 	if !testColumnExists(t, app.db, "usage_records", "ttft_ms") {
 		t.Fatal("usage_records.ttft_ms was not created")
+	}
+	if testColumnExists(t, app.db, "usage_records", "raw_json") {
+		t.Fatal("usage_records.raw_json should be split into usage_record_payloads")
+	}
+	if !testTableExists(t, app.db, "usage_record_payloads") {
+		t.Fatal("usage_record_payloads was not created")
 	}
 	if !testColumnExists(t, app.db, "model_prices", "cache_read_usd_per_million") {
 		t.Fatal("model_prices.cache_read_usd_per_million was not created")
@@ -81,8 +88,8 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	if err := app.db.QueryRow(`SELECT MAX(version_id) FROM goose_db_version`).Scan(&version); err != nil {
 		t.Fatalf("query goose version: %v", err)
 	}
-	if version != 202605280001 {
-		t.Fatalf("goose version = %d, want 202605280001", version)
+	if version != 202605310002 {
+		t.Fatalf("goose version = %d, want 202605310002", version)
 	}
 }
 
@@ -289,6 +296,20 @@ func TestRunMigrationsRepairsOldPythonSchemaWithoutOldCode(t *testing.T) {
 	}
 	if requestUSD.Valid {
 		t.Fatalf("migrated request_usd = %v, want NULL", requestUSD.Float64)
+	}
+	var payloads int
+	if err := app.db.QueryRow(`SELECT COUNT(*) FROM usage_record_payloads`).Scan(&payloads); err != nil {
+		t.Fatalf("query usage payloads: %v", err)
+	}
+	if payloads != 2 {
+		t.Fatalf("usage payload count = %d, want 2", payloads)
+	}
+	var rawJSON string
+	if err := app.db.QueryRow(`SELECT raw_json FROM usage_record_payloads WHERE raw_json LIKE '%sk-old-test%' LIMIT 1`).Scan(&rawJSON); err != nil {
+		t.Fatalf("migrated usage payload not found: %v", err)
+	}
+	if !strings.Contains(rawJSON, "sk-old-test") {
+		t.Fatalf("migrated raw_json = %q, want old payload", rawJSON)
 	}
 }
 

@@ -1187,16 +1187,23 @@ func TestDBBackedAPIsReturnBeijingOffsetTimeStrings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("insert model price times: %v", err)
 	}
-	_, err = db.Exec(`
+	result, err := db.Exec(`
 		INSERT INTO usage_records (
 			created_at, timestamp, usage_username, api_key_description, provider,
 			model, endpoint, source, request_id, auth, latency_ms, failed,
 			input_tokens, output_tokens, cached_tokens, reasoning_tokens,
-			total_tokens, dedupe_key, raw_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, 2, 0, 0, 3, ?, '{}')
+			total_tokens, dedupe_key
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, 2, 0, 0, 3, ?)
 	`, "2026-05-13T12:47:53+08:00", "2026-05-13T12:47:44+08:00", "admin", "time key", "openai", "gpt-time-test", "/v1/chat/completions", "test", "req-time", "auth", 123.0, "dedupe-time-test")
 	if err != nil {
 		t.Fatalf("insert usage record times: %v", err)
+	}
+	usageRecordID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("usage record id times: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO usage_record_payloads (usage_record_id, raw_json, created_at) VALUES (?, '{}', ?)`, usageRecordID, "2026-05-13T12:47:53+08:00"); err != nil {
+		t.Fatalf("insert usage payload times: %v", err)
 	}
 
 	collector := collectorStatusTimeResponse{}

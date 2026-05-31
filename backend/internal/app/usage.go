@@ -18,6 +18,10 @@ import (
 
 var usageEmailPattern = regexp.MustCompile(`(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}`)
 
+const usageRecordColumns = `id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, reasoning_effort, endpoint, source,
+		source_account, request_id, auth, auth_index, latency_ms, ttft_ms, failed, input_tokens, output_tokens, cached_tokens,
+		cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens, dedupe_key`
+
 type UsageFilters struct {
 	Scope             string
 	Start             *time.Time
@@ -255,7 +259,7 @@ func (a *App) usageSummary(w http.ResponseWriter, r *http.Request, filters Usage
 	if err != nil {
 		return err
 	}
-	records, err := a.filteredUsageRecords(r.Context(), scoped, "")
+	records, err := a.filteredUsageRecordsForStats(r.Context(), scoped, "")
 	if err != nil {
 		return err
 	}
@@ -273,7 +277,7 @@ func (a *App) usageTrends(w http.ResponseWriter, r *http.Request, filters UsageF
 	if err != nil {
 		return err
 	}
-	records, err := a.filteredUsageRecords(r.Context(), scoped, "timestamp ASC")
+	records, err := a.filteredUsageRecordsForStats(r.Context(), scoped, "timestamp ASC")
 	if err != nil {
 		return err
 	}
@@ -302,7 +306,7 @@ func (a *App) usageRankings(w http.ResponseWriter, r *http.Request, filters Usag
 	if err != nil {
 		return err
 	}
-	records, err := a.filteredUsageRecords(r.Context(), scoped, "")
+	records, err := a.filteredUsageRecordsForStats(r.Context(), scoped, "")
 	if err != nil {
 		return err
 	}
@@ -324,7 +328,7 @@ func (a *App) usageDistributions(w http.ResponseWriter, r *http.Request, filters
 	if err != nil {
 		return err
 	}
-	records, err := a.filteredUsageRecords(r.Context(), scoped, "")
+	records, err := a.filteredUsageRecordsForStats(r.Context(), scoped, "")
 	if err != nil {
 		return err
 	}
@@ -342,7 +346,7 @@ func (a *App) usageOverview(w http.ResponseWriter, r *http.Request, filters Usag
 	if err != nil {
 		return err
 	}
-	records, err := a.filteredUsageRecords(r.Context(), scoped, "timestamp ASC")
+	records, err := a.filteredUsageRecordsForStats(r.Context(), scoped, "timestamp ASC")
 	if err != nil {
 		return err
 	}
@@ -359,9 +363,13 @@ func (a *App) usageOverview(w http.ResponseWriter, r *http.Request, filters Usag
 	if scope.IsAdmin {
 		userRanking = rankingFromRecords(records, prices, "user", users)
 	}
-	options, err := a.usageOptionsResponse(r.Context(), user, usageOptionFilters(filters))
-	if err != nil {
-		return err
+	options := emptyUsageOptionsResponse()
+	if includeUsageOverviewOptions(r) {
+		var err error
+		options, err = a.usageOptionsResponse(r.Context(), user, usageOptionFilters(filters))
+		if err != nil {
+			return err
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"summary":                     usageSummaryFromRecords(scoped, records, prices),
@@ -374,6 +382,26 @@ func (a *App) usageOverview(w http.ResponseWriter, r *http.Request, filters Usag
 		"options":                     options,
 	})
 	return nil
+}
+
+func includeUsageOverviewOptions(r *http.Request) bool {
+	value := strings.TrimSpace(r.URL.Query().Get("include_options"))
+	if value == "" {
+		return true
+	}
+	parsed, err := strconv.ParseBool(value)
+	return err != nil || parsed
+}
+
+func emptyUsageOptionsResponse() map[string]any {
+	return map[string]any{
+		"users":                []any{},
+		"api_key_descriptions": []any{},
+		"providers":            []string{},
+		"models":               []string{},
+		"sources":              []map[string]string{},
+		"endpoints":            []string{},
+	}
 }
 
 func (a *App) usageRecords(w http.ResponseWriter, r *http.Request, filters UsageFilters, user *AuthUser) error {
@@ -488,7 +516,7 @@ func (a *App) usageOptionsResponse(ctx context.Context, user *AuthUser, filters 
 		return values, rows.Err()
 	}
 	distinctSourceOptions := func() ([]map[string]string, error) {
-		rows, err := a.db.QueryContext(ctx, `SELECT DISTINCT source, auth, raw_json FROM usage_records `+where+` AND source IS NOT NULL`, args...)
+		rows, err := a.db.QueryContext(ctx, `SELECT DISTINCT source, auth FROM usage_records `+where+` AND source IS NOT NULL`, args...)
 		if err != nil {
 			return nil, err
 		}
@@ -499,15 +527,15 @@ func (a *App) usageOptionsResponse(ctx context.Context, user *AuthUser, filters 
 		}
 		values := map[string]sourceOption{}
 		for rows.Next() {
-			var source, auth, rawJSON sql.NullString
-			if err := rows.Scan(&source, &auth, &rawJSON); err != nil {
+			var source, auth sql.NullString
+			if err := rows.Scan(&source, &auth); err != nil {
 				return nil, err
 			}
 			sourceValue := strings.TrimSpace(source.String)
 			if !source.Valid || sourceValue == "" {
 				continue
 			}
-			record := UsageRecord{Source: &sourceValue, RawJSON: rawJSON.String}
+			record := UsageRecord{Source: &sourceValue}
 			if auth.Valid {
 				record.Auth = &auth.String
 			}
@@ -603,10 +631,16 @@ func parsePositiveInt(value string, fallback int) int {
 }
 
 func (a *App) filteredUsageRecords(ctx context.Context, filters UsageFilters, orderBy string) ([]UsageRecord, error) {
+	return a.filteredUsageRecordsWithRawJSON(ctx, filters, orderBy, true)
+}
+
+func (a *App) filteredUsageRecordsForStats(ctx context.Context, filters UsageFilters, orderBy string) ([]UsageRecord, error) {
+	return a.filteredUsageRecordsWithRawJSON(ctx, filters, orderBy, false)
+}
+
+func (a *App) filteredUsageRecordsWithRawJSON(ctx context.Context, filters UsageFilters, orderBy string, includeRawJSON bool) ([]UsageRecord, error) {
 	where, args := usageWhere(filters)
-	query := `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, reasoning_effort, endpoint, source,
-		source_account, request_id, auth, auth_index, latency_ms, ttft_ms, failed, input_tokens, output_tokens, cached_tokens,
-		cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens, dedupe_key, raw_json FROM usage_records ` + where
+	query := `SELECT ` + usageRecordSelectColumns(includeRawJSON) + ` FROM ` + usageRecordsFrom(includeRawJSON) + ` ` + where
 	if strings.TrimSpace(orderBy) != "" {
 		query += " ORDER BY " + orderBy
 	} else {
@@ -626,7 +660,7 @@ func (a *App) filteredUsageRecords(ctx context.Context, filters UsageFilters, or
 
 func (a *App) countUsageRecords(ctx context.Context, filters UsageFilters) (int, error) {
 	if hasUsagePostFilters(filters) {
-		records, err := a.filteredUsageRecords(ctx, filters, "")
+		records, err := a.filteredUsageRecordsForStats(ctx, filters, "")
 		if err != nil {
 			return 0, err
 		}
@@ -656,9 +690,7 @@ func (a *App) pagedUsageRecords(ctx context.Context, filters UsageFilters, page,
 	}
 	where, args := usageWhere(filters)
 	args = append(args, pageSize, (page-1)*pageSize)
-	rows, err := a.db.QueryContext(ctx, `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, reasoning_effort, endpoint, source,
-		source_account, request_id, auth, auth_index, latency_ms, ttft_ms, failed, input_tokens, output_tokens, cached_tokens,
-		cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens, dedupe_key, raw_json FROM usage_records `+where+` ORDER BY timestamp DESC LIMIT ? OFFSET ?`, args...)
+	rows, err := a.db.QueryContext(ctx, `SELECT `+usageRecordSelectColumns(true)+` FROM `+usageRecordsFrom(true)+` `+where+` ORDER BY timestamp DESC LIMIT ? OFFSET ?`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -688,9 +720,7 @@ func applyUsagePostFilters(records []UsageRecord, filters UsageFilters) []UsageR
 }
 
 func (a *App) getUsageRecord(ctx context.Context, id int) (UsageRecord, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, reasoning_effort, endpoint, source,
-		source_account, request_id, auth, auth_index, latency_ms, ttft_ms, failed, input_tokens, output_tokens, cached_tokens,
-		cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens, dedupe_key, raw_json FROM usage_records WHERE id = ?`, id)
+	rows, err := a.db.QueryContext(ctx, `SELECT `+usageRecordSelectColumns(true)+` FROM `+usageRecordsFrom(true)+` WHERE id = ?`, id)
 	if err != nil {
 		return UsageRecord{}, err
 	}
@@ -745,6 +775,20 @@ func usageWhere(filters UsageFilters) (string, []any) {
 		args = append(args, "%"+*filters.RequestID+"%")
 	}
 	return "WHERE " + strings.Join(clauses, " AND "), args
+}
+
+func usageRecordSelectColumns(includeRawJSON bool) string {
+	if includeRawJSON {
+		return usageRecordColumns + `, COALESCE(usage_record_payloads.raw_json, '') AS raw_json`
+	}
+	return usageRecordColumns + `, '' AS raw_json`
+}
+
+func usageRecordsFrom(includeRawJSON bool) string {
+	if includeRawJSON {
+		return `usage_records LEFT JOIN usage_record_payloads ON usage_record_payloads.usage_record_id = usage_records.id`
+	}
+	return `usage_records`
 }
 
 func scanUsageRecords(rows *sql.Rows) ([]UsageRecord, error) {
@@ -1261,14 +1305,19 @@ func (a *App) saveUsageMessage(ctx context.Context, raw []byte) (UsageRecord, bo
 		return UsageRecord{}, false, err
 	}
 	now := dbTime(time.Now())
-	result, err := a.db.ExecContext(ctx, `
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return UsageRecord{}, false, err
+	}
+	result, err := tx.ExecContext(ctx, `
 		INSERT INTO usage_records (
 			created_at, timestamp, usage_username, api_key_description, provider, model, endpoint,
 			reasoning_effort, source, source_account, request_id, auth, auth_index, latency_ms, ttft_ms, failed, input_tokens, output_tokens,
-			cached_tokens, cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens, dedupe_key, raw_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, now, dbTime(normalized.Timestamp), usageUsername, description, normalized.Provider, normalized.Model, normalized.Endpoint, normalized.ReasoningEffort, normalized.Source, normalized.SourceAccount, normalized.RequestID, normalized.Auth, normalized.AuthIndex, normalized.LatencyMS, normalized.TTFTMS, normalized.Failed, normalized.InputTokens, normalized.OutputTokens, normalized.CachedTokens, normalized.CacheReadTokens, normalized.CacheCreationTokens, normalized.ReasoningTokens, normalized.TotalTokens, normalized.DedupeKey, normalized.RawJSON)
+			cached_tokens, cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens, dedupe_key
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, now, dbTime(normalized.Timestamp), usageUsername, description, normalized.Provider, normalized.Model, normalized.Endpoint, normalized.ReasoningEffort, normalized.Source, normalized.SourceAccount, normalized.RequestID, normalized.Auth, normalized.AuthIndex, normalized.LatencyMS, normalized.TTFTMS, normalized.Failed, normalized.InputTokens, normalized.OutputTokens, normalized.CachedTokens, normalized.CacheReadTokens, normalized.CacheCreationTokens, normalized.ReasoningTokens, normalized.TotalTokens, normalized.DedupeKey)
 	if err != nil {
+		_ = tx.Rollback()
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			record, getErr := a.usageRecordByDedupe(ctx, normalized.DedupeKey)
 			return record, false, getErr
@@ -1276,6 +1325,16 @@ func (a *App) saveUsageMessage(ctx context.Context, raw []byte) (UsageRecord, bo
 		return UsageRecord{}, false, err
 	}
 	id, _ := result.LastInsertId()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO usage_record_payloads (usage_record_id, raw_json, created_at)
+		VALUES (?, ?, ?)
+	`, id, normalized.RawJSON, now); err != nil {
+		_ = tx.Rollback()
+		return UsageRecord{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return UsageRecord{}, false, err
+	}
 	record, err := a.getUsageRecord(ctx, int(id))
 	if err != nil {
 		return UsageRecord{}, false, err
@@ -1287,9 +1346,7 @@ func (a *App) saveUsageMessage(ctx context.Context, raw []byte) (UsageRecord, bo
 }
 
 func (a *App) usageRecordByDedupe(ctx context.Context, dedupeKey string) (UsageRecord, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, reasoning_effort, endpoint, source,
-		source_account, request_id, auth, auth_index, latency_ms, ttft_ms, failed, input_tokens, output_tokens, cached_tokens,
-		cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens, dedupe_key, raw_json FROM usage_records WHERE dedupe_key = ?`, dedupeKey)
+	rows, err := a.db.QueryContext(ctx, `SELECT `+usageRecordSelectColumns(true)+` FROM `+usageRecordsFrom(true)+` WHERE dedupe_key = ?`, dedupeKey)
 	if err != nil {
 		return UsageRecord{}, err
 	}

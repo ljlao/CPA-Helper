@@ -931,7 +931,7 @@ func (a *App) userUsageSummaries(ctx context.Context) (map[string]userUsageSumma
 		return nil, err
 	}
 	filters := UsageFilters{}
-	records, err := a.filteredUsageRecords(ctx, filters, "")
+	records, err := a.filteredUsageRecordsForStats(ctx, filters, "")
 	if err != nil {
 		return nil, err
 	}
