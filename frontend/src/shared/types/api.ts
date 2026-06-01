@@ -178,6 +178,56 @@ export interface CodexKeeperQuotaWindowUsage {
   window_source: string
 }
 
+export interface CodexKeeperUsageStatsMetric {
+  records: number
+  success_records: number
+  failed_records: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  cache_read_tokens: number
+  cache_creation_tokens: number
+  reasoning_tokens: number
+  total_tokens: number
+  estimated_cost_usd: number
+  unpriced_records: number
+  first_request_at: string | null
+  last_request_at: string | null
+}
+
+export interface CodexKeeperUsageStatsSummary {
+  alive_days: number
+  alive_weeks: number
+  active_days: number
+  active_weeks: number
+  first_request_at: string | null
+  last_request_at: string | null
+  last_generated_at: string | null
+  today: CodexKeeperUsageStatsMetric
+  yesterday: CodexKeeperUsageStatsMetric
+  this_week: CodexKeeperUsageStatsMetric
+  last_week: CodexKeeperUsageStatsMetric
+  two_weeks_ago: CodexKeeperUsageStatsMetric
+  all_time: CodexKeeperUsageStatsMetric
+}
+
+export interface CodexKeeperUsageStatsPeriod extends CodexKeeperUsageStatsMetric {
+  period_type: 'day' | 'week'
+  period_start: string
+  period_end: string
+  label: string
+  generated_at: string
+}
+
+export interface CodexKeeperAccountUsageStats {
+  auth_name: string
+  email: string | null
+  account_type: string | null
+  summary: CodexKeeperUsageStatsSummary
+  daily: CodexKeeperUsageStatsPeriod[]
+  weekly: CodexKeeperUsageStatsPeriod[]
+}
+
 export interface CodexKeeperAccount {
   name: string
   email: string | null
@@ -192,6 +242,7 @@ export interface CodexKeeperAccount {
   secondary_window_seconds: number | null
   primary_window_usage: CodexKeeperQuotaWindowUsage | null
   secondary_window_usage: CodexKeeperQuotaWindowUsage | null
+  usage_stats: CodexKeeperUsageStatsSummary
   quota_threshold: number | null
   last_status_code: number | null
   last_error: string | null
@@ -200,8 +251,33 @@ export interface CodexKeeperAccount {
   last_healthy_at: string | null
 }
 
+export interface CodexKeeperAccountsQuery {
+  page?: number | undefined
+  page_size?: number | undefined
+  keyword?: string | undefined
+  account_type?: string | undefined
+  priority?: string | undefined
+  status?: string | undefined
+  sort_key?: string | undefined
+  sort_direction?: string | undefined
+}
+
 export interface CodexKeeperAccountsResponse {
   items: CodexKeeperAccount[]
+  total: number
+  filtered_total: number
+  enabled_count: number
+  disabled_count: number
+  unauthorized_count: number
+  quota_exhausted_count: number
+  filtered_enabled_count: number
+  filtered_disabled_count: number
+  filtered_unauthorized_count: number
+  filtered_quota_exhausted_count: number
+  account_types: string[]
+  page: number
+  page_size: number
+  total_pages: number
 }
 
 export interface CodexKeeperBulkDeletePayload {

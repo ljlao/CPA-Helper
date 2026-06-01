@@ -41,6 +41,7 @@ import {
   deleteCodexKeeperAccount,
   disableCodexKeeperAccount,
   enableCodexKeeperAccount,
+  getCodexKeeperAccountUsageStats,
   getCodexKeeperStatus,
   getCodexKeeperSettings,
   listCodexKeeperAccounts,
@@ -49,9 +50,13 @@ import {
 } from '@/features/codex-keeper/api/codexKeeperApi'
 import type {
   CodexKeeperAccount,
+  CodexKeeperAccountUsageStats,
+  CodexKeeperAccountsQuery,
   CodexKeeperPriorityRule,
   CodexKeeperQuotaWindowUsage,
   CodexKeeperStatus,
+  CodexKeeperUsageStatsMetric,
+  CodexKeeperUsageStatsPeriod,
 } from '@/shared/types/api'
 import {
   BEIJING_TIME_ZONE,
@@ -65,7 +70,7 @@ type FixedPriorityFilter = 'all' | 'high' | 'minusOne' | 'low'
 type PriorityTypeFilter = `type:${string}`
 type PriorityFilter = FixedPriorityFilter | PriorityTypeFilter
 type AccountStatusFilter = 'all' | 'enabled' | 'disabled' | 'unauthorized' | 'quotaExhausted'
-type AccountDisplaySize = 50 | 100 | 150 | 200 | 'all'
+type AccountDisplaySize = 50 | 100 | 150 | 200
 type AccountListViewMode = 'table' | 'bar' | 'ring'
 type AccountSortKey = 'quotaDay' | 'quotaWeek' | 'accountType' | 'status' | 'priority' | 'lastCheckedAt'
 type SortDirection = 'asc' | 'desc'
@@ -79,6 +84,11 @@ type QuotaWindowItem = {
   usage: CodexKeeperQuotaWindowUsage | null
 }
 type QuotaUsageTag = { label: string; value: string; tone?: 'stale' }
+type UsageStatsDisplayItem = {
+  label: string
+  value: string
+  title: string
+}
 type AccountStatusPreferences = {
   displaySize?: unknown
   viewMode?: unknown
@@ -94,10 +104,26 @@ const ACCOUNT_TABLE_MAX_HEIGHT = 'min(620px, max(320px, calc(100dvh - 430px)))'
 const ACCOUNT_TABLE_VIRTUAL_THRESHOLD = 200
 const CODEX_FIVE_HOUR_WINDOW_SECONDS = 5 * 60 * 60
 const CODEX_WEEK_WINDOW_SECONDS = 7 * 24 * 60 * 60
-const disabledTableScrollX = 1302
-const normalTableScrollX = 1816
+const disabledTableScrollX = 1662
+const normalTableScrollX = 2176
 const KEEPER_STATUS_POLL_INTERVAL_MS = 3000
 const REFRESH_STATUS_POLL_INTERVAL_MS = 1500
+const EMPTY_USAGE_STATS_METRIC: CodexKeeperUsageStatsMetric = {
+  records: 0,
+  success_records: 0,
+  failed_records: 0,
+  input_tokens: 0,
+  output_tokens: 0,
+  cached_tokens: 0,
+  cache_read_tokens: 0,
+  cache_creation_tokens: 0,
+  reasoning_tokens: 0,
+  total_tokens: 0,
+  estimated_cost_usd: 0,
+  unpriced_records: 0,
+  first_request_at: null,
+  last_request_at: null,
+}
 const message = useMessage()
 const isLoading = ref(false)
 const isBulkDeleting = ref(false)
@@ -107,15 +133,29 @@ const accounts = ref<CodexKeeperAccount[]>([])
 const priorityRules = ref<CodexKeeperPriorityRule[]>([])
 const keeperStatus = ref<CodexKeeperStatus | null>(null)
 const selectedAccount = ref<CodexKeeperAccount | null>(null)
+const selectedAccountUsageStats = ref<CodexKeeperAccountUsageStats | null>(null)
+const isDetailStatsLoading = ref(false)
 const selectedDisabledAccountKeys = ref<DataTableRowKey[]>([])
 const refreshSelectMode = ref(false)
 const selectedRefreshAccountNames = ref<string[]>([])
 const detailOpen = ref(false)
-const accountDisplaySize = ref<AccountDisplaySize>(50)
-const disabledAccountPage = ref(1)
-const normalAccountPage = ref(1)
-const cardAccountPage = ref(1)
+const accountDisplaySize = ref<AccountDisplaySize>(200)
+const accountPage = ref(1)
 const accountListViewMode = ref<AccountListViewMode>('table')
+const accountTypes = ref<string[]>([])
+const accountListMeta = reactive({
+  total: 0,
+  filteredTotal: 0,
+  enabledCount: 0,
+  disabledCount: 0,
+  unauthorizedCount: 0,
+  quotaExhaustedCount: 0,
+  filteredEnabledCount: 0,
+  filteredDisabledCount: 0,
+  filteredUnauthorizedCount: 0,
+  filteredQuotaExhaustedCount: 0,
+  totalPages: 1,
+})
 const filters = reactive({
   keyword: '',
   accountType: null as string | null,
@@ -146,6 +186,9 @@ const priorityDialog = reactive({
   value: null as number | null,
 })
 let refreshPollToken = 0
+let detailStatsToken = 0
+let accountLoadToken = 0
+let accountLoadTimer: number | undefined
 let keeperStatusTimer: number | undefined
 
 const priorityRuleMap = computed(() =>
@@ -174,7 +217,6 @@ const accountDisplaySizeOptions: Array<{ label: string; value: AccountDisplaySiz
   { label: '100', value: 100 },
   { label: '150', value: 150 },
   { label: '200', value: 200 },
-  { label: '全部', value: 'all' },
 ]
 const accountListViewOptions = [
   { label: '表格', key: 'table', icon: () => h(NIcon, null, { default: () => h(Table2) }) },
@@ -187,38 +229,22 @@ const quotaSortOptions = [
 ]
 
 const accountTypeOptions = computed(() =>
-  [...new Set(accounts.value.map((item) => item.account_type).filter(Boolean))]
+  accountTypes.value
+    .filter(Boolean)
     .sort((a, b) => String(a).localeCompare(String(b)))
     .map((value) => ({ label: String(value), value: String(value) })),
 )
 
-const filteredAccounts = computed(() =>
-  accounts.value.filter((account) => {
-    const keyword = filters.keyword.trim().toLowerCase()
-    if (
-      keyword &&
-      ![account.name, account.email ?? ''].some((value) => value.toLowerCase().includes(keyword))
-    ) {
-      return false
-    }
-    if (filters.accountType && account.account_type !== filters.accountType) {
-      return false
-    }
-    return matchesPriorityFilter(account, filters.priority) && matchesStatusFilter(account, filters.status)
-  }),
-)
+const filteredAccounts = computed(() => accounts.value)
 const filteredDisabledAccounts = computed(() =>
-  sortAccountsForDisplay(filteredAccounts.value.filter((account) => account.disabled)),
+  filteredAccounts.value.filter((account) => account.disabled),
 )
 const filteredNormalAccounts = computed(() =>
-  sortAccountsForDisplay(
-    filteredAccounts.value.filter((account) => !account.disabled),
-    compareNormalAccounts,
-  ),
+  filteredAccounts.value.filter((account) => !account.disabled),
 )
 const tableLoading = computed(() => isLoading.value)
-const enabledAccountCount = computed(() => accounts.value.filter((account) => !account.disabled).length)
-const disabledAccountCount = computed(() => accounts.value.filter((account) => account.disabled).length)
+const enabledAccountCount = computed(() => accountListMeta.enabledCount)
+const disabledAccountCount = computed(() => accountListMeta.disabledCount)
 const hasDisabledAccounts = computed(() => disabledAccountCount.value > 0)
 const showDisabledSection = computed(
   () => filters.status !== 'enabled' && filteredDisabledAccounts.value.length > 0,
@@ -262,10 +288,10 @@ const keeperStatusFootnoteText = computed(() =>
   isKeeperDaemonRunning.value ? '等待 Cron 调度' : '后台自动巡检',
 )
 const unauthorizedErrorAccountCount = computed(
-  () => accounts.value.filter((account) => account.last_status_code === 401).length,
+  () => accountListMeta.unauthorizedCount,
 )
 const quotaExhaustedAccountCount = computed(
-  () => accounts.value.filter(isQuotaExhaustedAccount).length,
+  () => accountListMeta.quotaExhaustedCount,
 )
 const activeFilterCount = computed(
   () =>
@@ -289,70 +315,59 @@ const sortedCardAccounts = computed(() => [
   ...filteredDisabledAccounts.value,
   ...filteredNormalAccounts.value,
 ])
-const isDisplayAllAccounts = computed(() => accountDisplaySize.value === 'all')
 const disabledTableDisplayProps = computed(() =>
   accountTableDisplayProps(visibleDisabledAccounts.value.length),
 )
 const normalTableDisplayProps = computed(() =>
   accountTableDisplayProps(visibleNormalAccounts.value.length),
 )
-const accountPaginationPageSize = computed(() =>
-  accountDisplaySize.value === 'all' ? 1 : accountDisplaySize.value,
-)
-const disabledAccountPageCount = computed(() => accountPageCount(filteredDisabledAccounts.value.length))
-const normalAccountPageCount = computed(() => accountPageCount(filteredNormalAccounts.value.length))
-const cardAccountPageCount = computed(() => accountPageCount(sortedCardAccounts.value.length))
-const showDisabledPagination = computed(() =>
-  shouldShowAccountPagination(filteredDisabledAccounts.value.length),
-)
-const showNormalPagination = computed(() =>
-  shouldShowAccountPagination(filteredNormalAccounts.value.length),
-)
-const showCardPagination = computed(() =>
-  shouldShowAccountPagination(sortedCardAccounts.value.length),
-)
+const accountPaginationPageSize = computed(() => accountDisplaySize.value)
+const accountTotalPageCount = computed(() => Math.max(1, accountListMeta.totalPages))
+const accountFilteredTotal = computed(() => accountListMeta.filteredTotal)
+const showAccountPagination = computed(() => accountFilteredTotal.value > accountDisplaySize.value)
 const visibleDisabledAccounts = computed(() =>
-  pagedAccounts(filteredDisabledAccounts.value, disabledAccountPage.value),
+  filteredDisabledAccounts.value,
 )
 const visibleNormalAccounts = computed(() =>
-  pagedAccounts(filteredNormalAccounts.value, normalAccountPage.value),
+  filteredNormalAccounts.value,
 )
 const visibleCardAccounts = computed(() =>
-  pagedAccounts(sortedCardAccounts.value, cardAccountPage.value),
+  sortedCardAccounts.value,
 )
 const disabledSectionDisplayText = computed(() =>
   accountDisplayText(
     visibleDisabledAccounts.value.length,
-    filteredDisabledAccounts.value.length,
-    disabledAccountPage.value,
-    disabledAccountPageCount.value,
+    accountListMeta.filteredDisabledCount,
   ),
 )
 const normalSectionDisplayText = computed(() =>
   accountDisplayText(
     visibleNormalAccounts.value.length,
-    filteredNormalAccounts.value.length,
-    normalAccountPage.value,
-    normalAccountPageCount.value,
+    accountListMeta.filteredEnabledCount,
   ),
 )
 const cardSectionDisplayText = computed(() =>
   accountDisplayText(
     visibleCardAccounts.value.length,
-    sortedCardAccounts.value.length,
-    cardAccountPage.value,
-    cardAccountPageCount.value,
+    accountFilteredTotal.value,
   ),
 )
 const showCardLoadingState = computed(() => isLoading.value && accounts.value.length === 0)
 const displaySizeHelpText = computed(() =>
   isTableView.value
-    ? isDisplayAllAccounts.value
-      ? '当前筛选结果全部展示，账号较多时自动使用虚拟滚动。'
-      : `每个分组每页显示 ${accountDisplaySize.value} 个账号。`
-    : isDisplayAllAccounts.value
-      ? '当前筛选结果全部以卡片展示，账号较多时使用轻量渲染优化。'
-      : `统一列表每页显示 ${accountDisplaySize.value} 个账号。`,
+    ? `每页从后台查询 ${accountDisplaySize.value} 个账号。`
+    : `卡片视图每页从后台查询 ${accountDisplaySize.value} 个账号。`,
+)
+const detailUsageSummaryItems = computed<UsageStatsDisplayItem[]>(() =>
+  selectedAccountUsageStats.value
+    ? usageStatsSummaryItems(selectedAccountUsageStats.value.summary)
+    : [],
+)
+const detailWeeklyRows = computed<CodexKeeperUsageStatsPeriod[]>(
+  () => selectedAccountUsageStats.value?.weekly ?? [],
+)
+const detailDailyRows = computed<CodexKeeperUsageStatsPeriod[]>(
+  () => selectedAccountUsageStats.value?.daily ?? [],
 )
 const activeQuotaSortLabel = computed(() => {
   if (accountSort.key === 'quotaDay') {
@@ -366,7 +381,7 @@ const activeQuotaSortLabel = computed(() => {
 const sortDirectionMark = computed(() => (accountSort.direction === 'asc' ? '↑' : '↓'))
 
 function accountTableDisplayProps(rowCount: number) {
-  return isDisplayAllAccounts.value && rowCount > ACCOUNT_TABLE_VIRTUAL_THRESHOLD
+  return rowCount > ACCOUNT_TABLE_VIRTUAL_THRESHOLD
     ? {
         virtualScroll: true,
         maxHeight: ACCOUNT_TABLE_MAX_HEIGHT,
@@ -377,36 +392,11 @@ function accountTableDisplayProps(rowCount: number) {
       }
 }
 
-function accountPageCount(rowCount: number): number {
-  if (accountDisplaySize.value === 'all') {
-    return 1
-  }
-  return Math.max(1, Math.ceil(rowCount / accountDisplaySize.value))
-}
-
-function shouldShowAccountPagination(rowCount: number): boolean {
-  return accountDisplaySize.value !== 'all' && rowCount > accountDisplaySize.value
-}
-
-function pagedAccounts(source: CodexKeeperAccount[], page: number): CodexKeeperAccount[] {
-  if (accountDisplaySize.value === 'all') {
-    return source
-  }
-  const safePage = clampPage(page, accountPageCount(source.length))
-  const start = (safePage - 1) * accountDisplaySize.value
-  return source.slice(start, start + accountDisplaySize.value)
-}
-
 function accountDisplayText(
   visibleCount: number,
   totalCount: number,
-  page: number,
-  pageCount: number,
 ): string {
-  if (isDisplayAllAccounts.value) {
-    return `显示 ${visibleCount} / ${totalCount} 个账号`
-  }
-  return `第 ${clampPage(page, pageCount)} / ${pageCount} 页，显示 ${visibleCount} / ${totalCount} 个账号`
+  return `第 ${clampPage(accountPage.value, accountTotalPageCount.value)} / ${accountTotalPageCount.value} 页，显示 ${visibleCount} / ${totalCount} 个账号`
 }
 
 function clampPage(page: number, pageCount: number): number {
@@ -414,19 +404,15 @@ function clampPage(page: number, pageCount: number): number {
 }
 
 function resetAccountPages() {
-  disabledAccountPage.value = 1
-  normalAccountPage.value = 1
-  cardAccountPage.value = 1
+  accountPage.value = 1
 }
 
 function clampAccountPages() {
-  disabledAccountPage.value = clampPage(disabledAccountPage.value, disabledAccountPageCount.value)
-  normalAccountPage.value = clampPage(normalAccountPage.value, normalAccountPageCount.value)
-  cardAccountPage.value = clampPage(cardAccountPage.value, cardAccountPageCount.value)
+  accountPage.value = clampPage(accountPage.value, accountTotalPageCount.value)
 }
 
 function isAccountDisplaySize(value: unknown): value is AccountDisplaySize {
-  return value === 50 || value === 100 || value === 150 || value === 200 || value === 'all'
+  return value === 50 || value === 100 || value === 150 || value === 200
 }
 
 function isAccountListViewMode(value: unknown): value is AccountListViewMode {
@@ -545,7 +531,7 @@ const bulkDeleteDialogTitle = computed(() =>
 )
 const bulkDeleteWarningText = computed(() =>
   bulkDeleteDialog.source === 'disabled401'
-    ? `将删除当前筛选下 ${selectedDisabledCount.value} 个 HTTP 401 已禁用账号，并从 CPA 删除 auth file。此操作不可恢复。`
+    ? `将删除当前页 ${selectedDisabledCount.value} 个 HTTP 401 已禁用账号，并从 CPA 删除 auth file。此操作不可恢复。`
     : `将删除已选 ${selectedDisabledCount.value} 个已禁用账号，并从 CPA 删除 auth file。此操作不可恢复。`,
 )
 const canSubmitPriority = computed(() => {
@@ -593,44 +579,6 @@ const priorityModeOptions = computed(() => {
     },
   ]
 })
-
-function matchesPriorityFilter(account: CodexKeeperAccount, value: PriorityFilter): boolean {
-  const priority = accountPriority(account)
-  if (value === 'high') {
-    return priority > 20
-  }
-  if (value === 'minusOne') {
-    return priority === -1
-  }
-  if (value === 'low') {
-    return priority < -1
-  }
-  const accountType = priorityTypeFromFilter(value)
-  if (accountType !== null) {
-    return (
-      account.account_type === accountType &&
-      priority >= 0 &&
-      priority <= 20
-    )
-  }
-  return true
-}
-
-function matchesStatusFilter(account: CodexKeeperAccount, value: AccountStatusFilter): boolean {
-  if (value === 'enabled') {
-    return !account.disabled
-  }
-  if (value === 'disabled') {
-    return account.disabled
-  }
-  if (value === 'unauthorized') {
-    return account.last_status_code === 401
-  }
-  if (value === 'quotaExhausted') {
-    return isQuotaExhaustedAccount(account)
-  }
-  return true
-}
 
 function hasAccountError(account: CodexKeeperAccount): boolean {
   return (account.last_error?.trim() ?? '') !== ''
@@ -687,118 +635,6 @@ function isQuotaExhaustedAccount(account: CodexKeeperAccount): boolean {
 
 function priorityTypeFilter(accountType: string): PriorityTypeFilter {
   return `type:${accountType}`
-}
-
-function priorityTypeFromFilter(value: PriorityFilter): string | null {
-  return value.startsWith('type:') ? value.slice('type:'.length) : null
-}
-
-function normalAccountTypePriority(account: CodexKeeperAccount): number {
-  if (!account.account_type) {
-    return Number.NEGATIVE_INFINITY
-  }
-  return priorityRuleMap.value[account.account_type] ?? Number.NEGATIVE_INFINITY
-}
-
-function compareNormalAccounts(left: CodexKeeperAccount, right: CodexKeeperAccount): number {
-  const priorityDiff = normalAccountTypePriority(right) - normalAccountTypePriority(left)
-  if (priorityDiff !== 0) {
-    return priorityDiff
-  }
-  return compareAccountFileName(left, right)
-}
-
-function sortAccountsForDisplay(
-  source: CodexKeeperAccount[],
-  defaultCompare?: (left: CodexKeeperAccount, right: CodexKeeperAccount) => number,
-): CodexKeeperAccount[] {
-  const rows = [...source]
-  if (accountSort.key === null) {
-    return defaultCompare ? rows.sort(defaultCompare) : rows
-  }
-  return rows.sort(compareAccountsByActiveSort)
-}
-
-function compareAccountsByActiveSort(left: CodexKeeperAccount, right: CodexKeeperAccount): number {
-  const direction = accountSort.direction
-  let result = 0
-  switch (accountSort.key) {
-    case 'quotaDay':
-    case 'quotaWeek':
-      result = compareNullableNumber(
-        quotaSortRemainingPercent(left, accountSort.key),
-        quotaSortRemainingPercent(right, accountSort.key),
-        direction,
-      )
-      break
-    case 'accountType':
-      result = compareNullableString(left.account_type, right.account_type, direction)
-      break
-    case 'status':
-      result = compareNullableNumber(left.disabled ? 1 : 0, right.disabled ? 1 : 0, direction)
-      break
-    case 'priority':
-      result = compareNullableNumber(accountPriority(left), accountPriority(right), direction)
-      break
-    case 'lastCheckedAt':
-      result = compareNullableNumber(
-        timestampValue(left.last_checked_at),
-        timestampValue(right.last_checked_at),
-        direction,
-      )
-      break
-    default:
-      result = 0
-  }
-  return result === 0 ? compareAccountFileName(left, right) : result
-}
-
-function compareNullableNumber(
-  left: number | null,
-  right: number | null,
-  direction: SortDirection,
-): number {
-  if (left === null && right === null) {
-    return 0
-  }
-  if (left === null) {
-    return 1
-  }
-  if (right === null) {
-    return -1
-  }
-  const result = left - right
-  return direction === 'asc' ? result : -result
-}
-
-function compareNullableString(
-  left: string | null,
-  right: string | null,
-  direction: SortDirection,
-): number {
-  if (left === null && right === null) {
-    return 0
-  }
-  if (left === null) {
-    return 1
-  }
-  if (right === null) {
-    return -1
-  }
-  const result = left.localeCompare(right)
-  return direction === 'asc' ? result : -result
-}
-
-function timestampValue(value: string | null): number | null {
-  if (!value) {
-    return null
-  }
-  const timestamp = new Date(value).getTime()
-  return Number.isNaN(timestamp) ? null : timestamp
-}
-
-function compareAccountFileName(left: CodexKeeperAccount, right: CodexKeeperAccount): number {
-  return left.name.localeCompare(right.name)
 }
 
 function defaultPriority(account: CodexKeeperAccount): number | null {
@@ -876,31 +712,6 @@ function quotaWindowItems(account: CodexKeeperAccount): QuotaWindowItem[] {
     })
   }
   return items
-}
-
-function quotaSortRemainingPercent(account: CodexKeeperAccount, key: AccountSortKey): number | null {
-  if (!shouldShowQuotaWindow(account)) {
-    return null
-  }
-  if (key === 'quotaDay') {
-    if (isFreeQuotaWindow(account)) {
-      return null
-    }
-    return nullableRemainingQuotaPercent(account.primary_used_percent)
-  }
-  if (key === 'quotaWeek') {
-    if (isFreeQuotaWindow(account)) {
-      return nullableRemainingQuotaPercent(account.primary_used_percent)
-    }
-    if (isPaidQuotaWindow(account)) {
-      return nullableRemainingQuotaPercent(account.secondary_used_percent)
-    }
-  }
-  return null
-}
-
-function nullableRemainingQuotaPercent(usedPercent: number | null): number | null {
-  return usedPercent === null ? null : remainingQuotaPercent(usedPercent)
 }
 
 function remainingQuotaPercent(usedPercent: number): number {
@@ -997,6 +808,128 @@ function quotaWindowUsageTone(item: QuotaWindowItem): string {
 
 function latestActionText(account: CodexKeeperAccount): string {
   return account.last_error?.trim() || account.latest_action?.trim() || '-'
+}
+
+function usageStatsMetric(metric: CodexKeeperUsageStatsMetric | null | undefined): CodexKeeperUsageStatsMetric {
+  return metric ?? EMPTY_USAGE_STATS_METRIC
+}
+
+function usageStatsRequestValue(metric: CodexKeeperUsageStatsMetric | null | undefined): string {
+  return `${formatInteger(usageStatsMetric(metric).records)}次`
+}
+
+function usageStatsMetricTitle(label: string, metric: CodexKeeperUsageStatsMetric | null | undefined): string {
+  const stats = usageStatsMetric(metric)
+  const failed = stats.failed_records > 0 ? `，失败 ${formatInteger(stats.failed_records)} 次` : ''
+  const unpriced = stats.unpriced_records > 0 ? `，未计价 ${formatInteger(stats.unpriced_records)} 条` : ''
+  return `${label}：${formatInteger(stats.records)} 次请求${failed}，${formatCompact(stats.total_tokens)} Tokens，${formatUsd(stats.estimated_cost_usd)}${unpriced}`
+}
+
+function accountUsageStatsItems(account: CodexKeeperAccount): UsageStatsDisplayItem[] {
+  const stats = account.usage_stats
+  return [
+    {
+      label: '存活',
+      value: `${formatInteger(stats?.alive_days ?? 0)}天`,
+      title: `存活 ${formatInteger(stats?.alive_days ?? 0)} 天，活跃 ${formatInteger(stats?.active_weeks ?? 0)} 周 / ${formatInteger(stats?.active_days ?? 0)} 天`,
+    },
+    {
+      label: '本周',
+      value: usageStatsRequestValue(stats?.this_week),
+      title: usageStatsMetricTitle('本周', stats?.this_week),
+    },
+    {
+      label: '上周',
+      value: usageStatsRequestValue(stats?.last_week),
+      title: usageStatsMetricTitle('上周', stats?.last_week),
+    },
+    {
+      label: '上上周',
+      value: usageStatsRequestValue(stats?.two_weeks_ago),
+      title: usageStatsMetricTitle('上上周', stats?.two_weeks_ago),
+    },
+  ]
+}
+
+function usageStatsSummaryItems(stats: CodexKeeperAccountUsageStats['summary']): UsageStatsDisplayItem[] {
+  return [
+    {
+      label: '存活',
+      value: `${formatInteger(stats.alive_days)}天`,
+      title: `存活 ${formatInteger(stats.alive_days)} 天，折合 ${formatInteger(stats.alive_weeks)} 周`,
+    },
+    {
+      label: '活跃',
+      value: `${formatInteger(stats.active_weeks)}周`,
+      title: `有请求的周 ${formatInteger(stats.active_weeks)} 个，有请求的天 ${formatInteger(stats.active_days)} 天`,
+    },
+    {
+      label: '本周',
+      value: usageStatsRequestValue(stats.this_week),
+      title: usageStatsMetricTitle('本周', stats.this_week),
+    },
+    {
+      label: '上周',
+      value: usageStatsRequestValue(stats.last_week),
+      title: usageStatsMetricTitle('上周', stats.last_week),
+    },
+    {
+      label: '上上周',
+      value: usageStatsRequestValue(stats.two_weeks_ago),
+      title: usageStatsMetricTitle('上上周', stats.two_weeks_ago),
+    },
+    {
+      label: '累计',
+      value: usageStatsRequestValue(stats.all_time),
+      title: usageStatsMetricTitle('累计', stats.all_time),
+    },
+  ]
+}
+
+function usageStatsPeriodTokenText(row: CodexKeeperUsageStatsPeriod): string {
+  return formatCompact(row.total_tokens)
+}
+
+function usageStatsPeriodCostText(row: CodexKeeperUsageStatsPeriod): string {
+  return formatUsd(row.estimated_cost_usd)
+}
+
+function usageStatsPeriodFirstLastText(row: CodexKeeperUsageStatsPeriod): string {
+  const first = formatDateTime(row.first_request_at, { includeSecond: false })
+  const last = formatDateTime(row.last_request_at, { includeSecond: false })
+  if (first === '-' && last === '-') {
+    return '-'
+  }
+  return `${first} / ${last}`
+}
+
+function renderAccountAliveCell(account: CodexKeeperAccount) {
+  const stats = account.usage_stats
+  const aliveDays = stats?.alive_days ?? 0
+  const activeWeeks = stats?.active_weeks ?? 0
+  return h(
+    'span',
+    {
+      class: ['account-table-value-pill', 'is-usage-stat'],
+      title: `存活 ${formatInteger(aliveDays)} 天，活跃 ${formatInteger(activeWeeks)} 周`,
+    },
+    `${formatInteger(aliveDays)}天`,
+  )
+}
+
+function renderAccountUsageStatsCell(account: CodexKeeperAccount) {
+  return h(
+    'div',
+    { class: 'account-usage-stats-cell' },
+    accountUsageStatsItems(account)
+      .filter((item) => item.label !== '存活')
+      .map((item) =>
+        h('span', { class: 'account-usage-stat-chip', title: item.title }, [
+          h('span', { class: 'account-usage-stat-label' }, item.label),
+          h('strong', { class: 'account-usage-stat-value' }, item.value),
+        ]),
+      ),
+  )
 }
 
 function disabledCardErrorText(account: CodexKeeperAccount): string {
@@ -1158,21 +1091,76 @@ function renderLatestActionCell(account: CodexKeeperAccount) {
 }
 
 async function loadAccounts() {
+  const token = ++accountLoadToken
   isLoading.value = true
   try {
+    const query = codexKeeperAccountsQuery()
+    const settingsRequest =
+      priorityRules.value.length === 0 ? getCodexKeeperSettings() : Promise.resolve(null)
     const [accountsResponse, settings, nextStatus] = await Promise.all([
-      listCodexKeeperAccounts(),
-      getCodexKeeperSettings(),
+      listCodexKeeperAccounts(query),
+      settingsRequest,
       getCodexKeeperStatus(),
     ])
+    if (token !== accountLoadToken) {
+      return
+    }
     accounts.value = accountsResponse.items
-    priorityRules.value = settings.priority_rules
+    accountTypes.value = accountsResponse.account_types ?? []
+    accountListMeta.total = accountsResponse.total
+    accountListMeta.filteredTotal = accountsResponse.filtered_total
+    accountListMeta.enabledCount = accountsResponse.enabled_count
+    accountListMeta.disabledCount = accountsResponse.disabled_count
+    accountListMeta.unauthorizedCount = accountsResponse.unauthorized_count
+    accountListMeta.quotaExhaustedCount = accountsResponse.quota_exhausted_count
+    accountListMeta.filteredEnabledCount = accountsResponse.filtered_enabled_count
+    accountListMeta.filteredDisabledCount = accountsResponse.filtered_disabled_count
+    accountListMeta.filteredUnauthorizedCount = accountsResponse.filtered_unauthorized_count
+    accountListMeta.filteredQuotaExhaustedCount = accountsResponse.filtered_quota_exhausted_count
+    accountListMeta.totalPages = Math.max(1, accountsResponse.total_pages)
+    accountPage.value = clampPage(accountsResponse.page, accountListMeta.totalPages)
+    if (settings !== null) {
+      priorityRules.value = settings.priority_rules
+    }
     keeperStatus.value = nextStatus
+    if (selectedAccount.value) {
+      const nextSelected = accountsResponse.items.find((account) => account.name === selectedAccount.value?.name)
+      if (nextSelected) {
+        selectedAccount.value = nextSelected
+      }
+    }
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '加载账号状态失败')
+    if (token === accountLoadToken) {
+      message.error(error instanceof Error ? error.message : '加载账号状态失败')
+    }
   } finally {
-    isLoading.value = false
+    if (token === accountLoadToken) {
+      isLoading.value = false
+    }
   }
+}
+
+function codexKeeperAccountsQuery(): CodexKeeperAccountsQuery {
+  return {
+    page: accountPage.value,
+    page_size: accountDisplaySize.value,
+    keyword: filters.keyword.trim() || undefined,
+    account_type: filters.accountType ?? undefined,
+    priority: filters.priority === 'all' ? undefined : filters.priority,
+    status: filters.status === 'all' ? undefined : filters.status,
+    sort_key: accountSort.key ?? undefined,
+    sort_direction: accountSort.key === null ? undefined : accountSort.direction,
+  }
+}
+
+function scheduleLoadAccounts() {
+  if (accountLoadTimer !== undefined) {
+    window.clearTimeout(accountLoadTimer)
+  }
+  accountLoadTimer = window.setTimeout(() => {
+    accountLoadTimer = undefined
+    void loadAccounts()
+  }, 180)
 }
 
 async function loadKeeperStatus() {
@@ -1316,7 +1304,28 @@ async function submitBulkDelete() {
 
 function openDetail(account: CodexKeeperAccount) {
   selectedAccount.value = account
+  selectedAccountUsageStats.value = null
   detailOpen.value = true
+  void loadAccountUsageStats(account)
+}
+
+async function loadAccountUsageStats(account: CodexKeeperAccount) {
+  const token = ++detailStatsToken
+  isDetailStatsLoading.value = true
+  try {
+    const stats = await getCodexKeeperAccountUsageStats(account.name)
+    if (token === detailStatsToken && selectedAccount.value?.name === account.name) {
+      selectedAccountUsageStats.value = stats
+    }
+  } catch (error) {
+    if (token === detailStatsToken) {
+      message.error(error instanceof Error ? error.message : '加载账号统计失败')
+    }
+  } finally {
+    if (token === detailStatsToken) {
+      isDetailStatsLoading.value = false
+    }
+  }
 }
 
 function openPriorityDialog(account: CodexKeeperAccount) {
@@ -1581,6 +1590,45 @@ async function runAccountAction(
   }
 }
 
+const usageStatsPeriodColumns: DataTableColumns<CodexKeeperUsageStatsPeriod> = [
+  {
+    title: '周期',
+    key: 'label',
+    width: 168,
+    render: (row) => h('span', { title: row.label }, row.label),
+  },
+  {
+    title: '请求',
+    key: 'records',
+    width: 82,
+    render: (row) => formatInteger(row.records),
+  },
+  {
+    title: '失败',
+    key: 'failed_records',
+    width: 72,
+    render: (row) => formatInteger(row.failed_records),
+  },
+  {
+    title: 'Tokens',
+    key: 'total_tokens',
+    width: 92,
+    render: (row) => usageStatsPeriodTokenText(row),
+  },
+  {
+    title: '费用',
+    key: 'estimated_cost_usd',
+    width: 96,
+    render: (row) => usageStatsPeriodCostText(row),
+  },
+  {
+    title: '首末请求',
+    key: 'first_last',
+    width: 168,
+    render: (row) => usageStatsPeriodFirstLastText(row),
+  },
+]
+
 const baseColumns: DataTableColumns<CodexKeeperAccount> = [
   {
     title: '账号',
@@ -1599,6 +1647,18 @@ const baseColumns: DataTableColumns<CodexKeeperAccount> = [
     key: 'priority',
     width: 88,
     render: (row) => renderAccountPriorityCell(row),
+  },
+  {
+    title: '存活',
+    key: 'alive_days',
+    width: 96,
+    render: (row) => renderAccountAliveCell(row),
+  },
+  {
+    title: '周统计',
+    key: 'usage_stats',
+    width: 264,
+    render: (row) => renderAccountUsageStatsCell(row),
   },
   {
     title: '额度窗口',
@@ -1768,7 +1828,6 @@ watch(
 watch(
   [
     accountDisplaySize,
-    accountListViewMode,
     () => accountSort.key,
     () => accountSort.direction,
     () => filters.keyword,
@@ -1776,12 +1835,13 @@ watch(
     () => filters.priority,
     () => filters.status,
   ],
-  resetAccountPages,
+  () => {
+    resetAccountPages()
+    scheduleLoadAccounts()
+  },
 )
-watch(
-  [disabledAccountPageCount, normalAccountPageCount, cardAccountPageCount],
-  clampAccountPages,
-)
+watch(accountPage, scheduleLoadAccounts)
+watch(accountTotalPageCount, clampAccountPages)
 watch(visibleDisabledAccounts, pruneSelectedDisabledAccountKeys)
 watch(filteredAccounts, pruneSelectedRefreshAccountNames)
 
@@ -1794,6 +1854,10 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   refreshPollToken += 1
+  accountLoadToken += 1
+  if (accountLoadTimer !== undefined) {
+    window.clearTimeout(accountLoadTimer)
+  }
   if (keeperStatusTimer !== undefined) {
     window.clearInterval(keeperStatusTimer)
   }
@@ -1837,7 +1901,7 @@ onBeforeUnmount(() => {
           <Users :size="20" :stroke-width="2.2" />
         </div>
         <div class="metric-label">账号总数</div>
-        <div class="metric-value">{{ formatInteger(accounts.length) }}</div>
+        <div class="metric-value">{{ formatInteger(accountListMeta.total) }}</div>
         <div class="metric-footnote">全部 auth file</div>
       </div>
       <button
@@ -1904,9 +1968,9 @@ onBeforeUnmount(() => {
           <div>
             <h2 class="toolbar-title">账号列表</h2>
             <p class="toolbar-subtitle">
-              正常 {{ filteredNormalAccounts.length }} / {{ enabledAccountCount }} 个账号
+              正常 {{ formatInteger(accountListMeta.filteredEnabledCount) }} / {{ formatInteger(enabledAccountCount) }} 个账号
               <template v-if="hasDisabledAccounts">
-                ，已禁用 {{ filteredDisabledAccounts.length }} / {{ disabledAccountCount }} 个账号
+                ，已禁用 {{ formatInteger(accountListMeta.filteredDisabledCount) }} / {{ formatInteger(disabledAccountCount) }} 个账号
               </template>
             </p>
           </div>
@@ -1960,7 +2024,7 @@ onBeforeUnmount(() => {
                 :disabled="filteredAccountNames.length === 0 || isBulkRefreshing"
                 @click="selectAllFilteredRefreshAccounts"
               >
-                全选当前筛选
+                全选当前页
               </NButton>
               <NButton
                 secondary
@@ -2069,14 +2133,6 @@ onBeforeUnmount(() => {
               <div class="empty-state">当前筛选下暂无已禁用账号</div>
             </template>
           </NDataTable>
-          <div v-if="showDisabledPagination" class="account-pagination-row">
-            <NPagination
-              v-model:page="disabledAccountPage"
-              size="small"
-              :page-size="accountPaginationPageSize"
-              :item-count="filteredDisabledAccounts.length"
-            />
-          </div>
         </section>
 
         <section v-if="showNormalSection" class="account-section">
@@ -2105,14 +2161,6 @@ onBeforeUnmount(() => {
               <div class="empty-state">当前筛选下暂无正常账号</div>
             </template>
           </NDataTable>
-          <div v-if="showNormalPagination" class="account-pagination-row">
-            <NPagination
-              v-model:page="normalAccountPage"
-              size="small"
-              :page-size="accountPaginationPageSize"
-              :item-count="filteredNormalAccounts.length"
-            />
-          </div>
         </section>
       </div>
       <div v-else class="account-card-shell">
@@ -2136,7 +2184,7 @@ onBeforeUnmount(() => {
                 <template #icon>
                   <NIcon :component="Trash2" />
                 </template>
-                批量删除 401 已禁用（{{ filteredUnauthorizedDisabledAccounts.length }}）
+                批量删除当前页 401（{{ filteredUnauthorizedDisabledAccounts.length }}）
               </NButton>
             </div>
           </div>
@@ -2199,6 +2247,17 @@ onBeforeUnmount(() => {
                     {{ disabledStatusCodeText(account) }}
                   </span>
                 </div>
+              </div>
+              <div class="account-card-usage-stats">
+                <span
+                  v-for="item in accountUsageStatsItems(account)"
+                  :key="item.label"
+                  class="account-card-usage-stat"
+                  :title="item.title"
+                >
+                  <span>{{ item.label }}</span>
+                  <strong>{{ item.value }}</strong>
+                </span>
               </div>
               <div class="account-card-meta-grid">
                 <div class="account-card-meta-item">
@@ -2296,15 +2355,16 @@ onBeforeUnmount(() => {
               </div>
             </button>
           </div>
-          <div v-if="showCardPagination" class="account-pagination-row">
-            <NPagination
-              v-model:page="cardAccountPage"
-              size="small"
-              :page-size="accountPaginationPageSize"
-              :item-count="sortedCardAccounts.length"
-            />
-          </div>
         </section>
+      </div>
+
+      <div v-if="showAccountPagination" class="account-pagination-row">
+        <NPagination
+          v-model:page="accountPage"
+          size="small"
+          :page-size="accountPaginationPageSize"
+          :item-count="accountFilteredTotal"
+        />
       </div>
 
       <div class="display-control-row">
@@ -2321,7 +2381,7 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <NDrawer v-model:show="detailOpen" placement="right" :width="420">
+    <NDrawer v-model:show="detailOpen" placement="right" :width="'min(760px, calc(100vw - 24px))'">
       <NDrawerContent>
         <template #header>
           <div class="detail-drawer-header">
@@ -2420,6 +2480,59 @@ onBeforeUnmount(() => {
               删除
             </NButton>
           </NSpace>
+        </div>
+        <div v-if="selectedAccount" class="detail-usage-stats">
+          <div class="detail-section-head">
+            <h3>额度请求统计</h3>
+            <span v-if="selectedAccountUsageStats?.summary.last_generated_at">
+              统计 {{ formatDateTime(selectedAccountUsageStats.summary.last_generated_at) }}
+            </span>
+          </div>
+          <div v-if="isDetailStatsLoading" class="detail-stats-loading">统计加载中...</div>
+          <template v-else-if="selectedAccountUsageStats">
+            <div class="detail-stats-grid">
+              <div
+                v-for="item in detailUsageSummaryItems"
+                :key="item.label"
+                class="detail-stat-card"
+                :title="item.title"
+              >
+                <span>{{ item.label }}</span>
+                <strong>{{ item.value }}</strong>
+              </div>
+            </div>
+            <div class="detail-table-block">
+              <div class="detail-section-head">
+                <h3>每周详情</h3>
+                <span>{{ detailWeeklyRows.length }} 周</span>
+              </div>
+              <NDataTable
+                class="detail-usage-table"
+                size="small"
+                :columns="usageStatsPeriodColumns"
+                :data="detailWeeklyRows"
+                :pagination="{ pageSize: 8 }"
+                table-layout="fixed"
+                :scroll-x="678"
+              />
+            </div>
+            <div class="detail-table-block">
+              <div class="detail-section-head">
+                <h3>每日详情</h3>
+                <span>{{ detailDailyRows.length }} 天</span>
+              </div>
+              <NDataTable
+                class="detail-usage-table"
+                size="small"
+                :columns="usageStatsPeriodColumns"
+                :data="detailDailyRows"
+                :pagination="{ pageSize: 10 }"
+                table-layout="fixed"
+                :scroll-x="678"
+              />
+            </div>
+          </template>
+          <div v-else class="detail-stats-loading">暂无统计数据</div>
         </div>
       </NDrawerContent>
     </NDrawer>
@@ -2984,6 +3097,45 @@ onBeforeUnmount(() => {
   font-variant-numeric: tabular-nums;
 }
 
+.account-card-usage-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  min-width: 0;
+}
+
+.account-card-usage-stat {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 6px 7px;
+  background: color-mix(in srgb, var(--account-card-accent) 6%, var(--account-card-inner-bg));
+  border: 1px solid color-mix(in srgb, var(--account-card-accent) 14%, var(--account-card-inner-border));
+  border-radius: var(--cpa-radius-sm);
+}
+
+.account-card-usage-stat span,
+.account-card-usage-stat strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-card-usage-stat span {
+  color: var(--cpa-text-muted);
+  font-size: 10px;
+  line-height: 1.1;
+}
+
+.account-card-usage-stat strong {
+  color: var(--cpa-text-strong);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
 .account-card-meta-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -3334,6 +3486,95 @@ onBeforeUnmount(() => {
   border-top: 1px solid var(--cpa-border);
 }
 
+.detail-usage-stats {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--cpa-border);
+}
+
+.detail-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.detail-section-head h3 {
+  margin: 0;
+  color: var(--cpa-text);
+  font-size: 14px;
+  font-weight: 760;
+  line-height: 1.25;
+}
+
+.detail-section-head span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--cpa-text-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-stats-loading {
+  padding: 18px;
+  color: var(--cpa-text-muted);
+  font-size: 13px;
+  text-align: center;
+  background: var(--cpa-surface-muted);
+  border: 1px dashed var(--cpa-border);
+  border-radius: var(--cpa-radius);
+}
+
+.detail-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.detail-stat-card {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 9px 10px;
+  background: color-mix(in srgb, var(--cpa-primary) 6%, var(--cpa-surface-muted));
+  border: 1px solid color-mix(in srgb, var(--cpa-primary) 14%, var(--cpa-border));
+  border-radius: var(--cpa-radius-sm);
+}
+
+.detail-stat-card span,
+.detail-stat-card strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-stat-card span {
+  color: var(--cpa-text-muted);
+  font-size: 11px;
+}
+
+.detail-stat-card strong {
+  color: var(--cpa-text-strong);
+  font-size: 14px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
+.detail-table-block {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.detail-usage-table {
+  min-width: 0;
+}
+
 .detail-drawer-header {
   display: flex;
   align-items: center;
@@ -3649,6 +3890,51 @@ onBeforeUnmount(() => {
   border-color: color-mix(in srgb, var(--cpa-primary) 22%, transparent);
 }
 
+:global(.account-table-value-pill.is-usage-stat) {
+  color: var(--cpa-accent-blue);
+  background: color-mix(in srgb, var(--cpa-accent-blue) 8%, var(--cpa-surface-muted));
+  border-color: color-mix(in srgb, var(--cpa-accent-blue) 22%, transparent);
+}
+
+:global(.account-usage-stats-cell) {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  min-width: 0;
+}
+
+:global(.account-usage-stat-chip) {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 6px 7px;
+  background: color-mix(in srgb, var(--cpa-accent-blue) 6%, var(--cpa-surface-muted));
+  border: 1px solid color-mix(in srgb, var(--cpa-accent-blue) 16%, var(--cpa-border));
+  border-radius: var(--cpa-radius-sm);
+}
+
+:global(.account-usage-stat-label),
+:global(.account-usage-stat-value) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:global(.account-usage-stat-label) {
+  color: var(--cpa-text-muted);
+  font-size: 10px;
+  line-height: 1.1;
+}
+
+:global(.account-usage-stat-value) {
+  color: var(--cpa-text-strong);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
 :global(.account-table-value-pill.is-action) {
   display: -webkit-box;
   line-height: 1.5;
@@ -3803,6 +4089,11 @@ onBeforeUnmount(() => {
 
   .account-card-status-group {
     justify-content: flex-start;
+  }
+
+  .account-card-usage-stats,
+  .detail-stats-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .account-card-meta-grid {

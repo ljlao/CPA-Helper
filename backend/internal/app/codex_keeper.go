@@ -30,6 +30,8 @@ const (
 	keeperQuotaWindowUsageCacheTTL = 30 * time.Second
 	keeperFiveHourWindowSeconds    = 5 * 60 * 60
 	keeperWeekWindowSeconds        = 7 * 24 * 60 * 60
+	keeperAccountsDefaultPageSize  = 200
+	keeperAccountsMaxPageSize      = 500
 )
 
 type KeeperRunner struct {
@@ -109,6 +111,53 @@ type keeperPriorityUpdateRequest struct {
 	Priority int `json:"priority"`
 }
 
+type keeperAccountListQuery struct {
+	Page          int
+	PageSize      int
+	Keyword       string
+	AccountType   string
+	Priority      string
+	Status        string
+	SortKey       string
+	SortDirection string
+}
+
+type keeperAccountListResult struct {
+	Accounts                  []keeperAccount
+	Total                     int
+	FilteredTotal             int
+	EnabledCount              int
+	DisabledCount             int
+	UnauthorizedCount         int
+	QuotaExhaustedCount       int
+	FilteredEnabledCount      int
+	FilteredDisabledCount     int
+	FilteredUnauthorizedCount int
+	FilteredQuotaExhausted    int
+	AccountTypes              []string
+	Page                      int
+	PageSize                  int
+	TotalPages                int
+}
+
+type keeperAccountListResponse struct {
+	Items                     []keeperAccountResponse `json:"items"`
+	Total                     int                     `json:"total"`
+	FilteredTotal             int                     `json:"filtered_total"`
+	EnabledCount              int                     `json:"enabled_count"`
+	DisabledCount             int                     `json:"disabled_count"`
+	UnauthorizedCount         int                     `json:"unauthorized_count"`
+	QuotaExhaustedCount       int                     `json:"quota_exhausted_count"`
+	FilteredEnabledCount      int                     `json:"filtered_enabled_count"`
+	FilteredDisabledCount     int                     `json:"filtered_disabled_count"`
+	FilteredUnauthorizedCount int                     `json:"filtered_unauthorized_count"`
+	FilteredQuotaExhausted    int                     `json:"filtered_quota_exhausted_count"`
+	AccountTypes              []string                `json:"account_types"`
+	Page                      int                     `json:"page"`
+	PageSize                  int                     `json:"page_size"`
+	TotalPages                int                     `json:"total_pages"`
+}
+
 type keeperAccount struct {
 	Name                   string     `json:"name"`
 	Email                  *string    `json:"email"`
@@ -143,6 +192,7 @@ type keeperAccountResponse struct {
 	SecondaryWindowSeconds *int                            `json:"secondary_window_seconds"`
 	PrimaryWindowUsage     *keeperQuotaWindowUsageResponse `json:"primary_window_usage"`
 	SecondaryWindowUsage   *keeperQuotaWindowUsageResponse `json:"secondary_window_usage"`
+	UsageStats             keeperUsageStatsSummaryResponse `json:"usage_stats"`
 	QuotaThreshold         *int                            `json:"quota_threshold"`
 	LastStatusCode         *int                            `json:"last_status_code"`
 	LastError              *string                         `json:"last_error"`
@@ -892,15 +942,36 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 		if err := requireMethod(r, http.MethodGet); err != nil {
 			return err
 		}
-		accounts, err := a.listKeeperAccounts(r.Context())
+		query := parseKeeperAccountListQuery(r.URL.Query())
+		result, err := a.listKeeperAccountsPage(r.Context(), query)
 		if err != nil {
 			return err
 		}
-		windowUsages, err := a.keeperQuotaWindowUsages(r.Context(), accounts)
+		windowUsages, err := a.keeperQuotaWindowUsages(r.Context(), result.Accounts)
 		if err != nil {
 			return err
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": keeperAccountResponses(accounts, windowUsages)})
+		usageStats, err := a.keeperUsageStatsSummaries(r.Context(), result.Accounts, time.Now().In(appTimeLocation))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, keeperAccountListResponse{
+			Items:                     keeperAccountResponses(result.Accounts, windowUsages, usageStats),
+			Total:                     result.Total,
+			FilteredTotal:             result.FilteredTotal,
+			EnabledCount:              result.EnabledCount,
+			DisabledCount:             result.DisabledCount,
+			UnauthorizedCount:         result.UnauthorizedCount,
+			QuotaExhaustedCount:       result.QuotaExhaustedCount,
+			FilteredEnabledCount:      result.FilteredEnabledCount,
+			FilteredDisabledCount:     result.FilteredDisabledCount,
+			FilteredUnauthorizedCount: result.FilteredUnauthorizedCount,
+			FilteredQuotaExhausted:    result.FilteredQuotaExhausted,
+			AccountTypes:              result.AccountTypes,
+			Page:                      result.Page,
+			PageSize:                  result.PageSize,
+			TotalPages:                result.TotalPages,
+		})
 		return nil
 	case len(parts) == 1 && parts[0] == "run-once":
 		if err := requireMethod(r, http.MethodPost); err != nil {
@@ -951,6 +1022,24 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 			return err
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "started"})
+		return nil
+	case len(parts) == 3 && parts[0] == "accounts" && parts[2] == "usage-stats":
+		if err := requireMethod(r, http.MethodGet); err != nil {
+			return err
+		}
+		authName, err := url.PathUnescape(parts[1])
+		if err != nil {
+			return validationError("账号名称无效")
+		}
+		authName, err = normalizeKeeperStatsAuthName(authName)
+		if err != nil {
+			return err
+		}
+		stats, err := a.keeperAccountUsageStats(r.Context(), authName, time.Now().In(appTimeLocation))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, stats)
 		return nil
 	case len(parts) == 3 && parts[0] == "accounts" && (parts[2] == "enable" || parts[2] == "disable"):
 		if err := requireMethod(r, http.MethodPost); err != nil {
@@ -1027,7 +1116,7 @@ func keeperSettingsResponse(cfg AppConfig) map[string]any {
 	}
 }
 
-func keeperAccountResponses(accounts []keeperAccount, windowUsages map[string]keeperQuotaWindowUsagePair) []keeperAccountResponse {
+func keeperAccountResponses(accounts []keeperAccount, windowUsages map[string]keeperQuotaWindowUsagePair, usageStats map[string]keeperUsageStatsSummaryResponse) []keeperAccountResponse {
 	responses := make([]keeperAccountResponse, 0, len(accounts))
 	for _, account := range accounts {
 		usage := windowUsages[account.Name]
@@ -1045,6 +1134,7 @@ func keeperAccountResponses(accounts []keeperAccount, windowUsages map[string]ke
 			SecondaryWindowSeconds: account.SecondaryWindowSeconds,
 			PrimaryWindowUsage:     keeperQuotaWindowUsageResponseFrom(usage.Primary),
 			SecondaryWindowUsage:   keeperQuotaWindowUsageResponseFrom(usage.Secondary),
+			UsageStats:             usageStats[account.Name],
 			QuotaThreshold:         account.QuotaThreshold,
 			LastStatusCode:         account.LastStatusCode,
 			LastError:              account.LastError,
@@ -2823,6 +2913,247 @@ func (a *App) listKeeperAccounts(ctx context.Context) ([]keeperAccount, error) {
 	return accounts, rows.Err()
 }
 
+func parseKeeperAccountListQuery(values url.Values) keeperAccountListQuery {
+	page := parseKeeperAccountPositiveInt(values.Get("page"), 1)
+	if page < 1 {
+		page = 1
+	}
+	pageSize := parseKeeperAccountPositiveInt(values.Get("page_size"), keeperAccountsDefaultPageSize)
+	pageSize = clampInt(pageSize, 1, keeperAccountsMaxPageSize, keeperAccountsDefaultPageSize)
+	sortKey := strings.TrimSpace(values.Get("sort_key"))
+	switch sortKey {
+	case "quotaDay", "quotaWeek", "accountType", "status", "priority", "lastCheckedAt":
+	default:
+		sortKey = ""
+	}
+	sortDirection := strings.ToLower(strings.TrimSpace(values.Get("sort_direction")))
+	if sortDirection != "desc" {
+		sortDirection = "asc"
+	}
+	status := strings.TrimSpace(values.Get("status"))
+	switch status {
+	case "enabled", "disabled", "unauthorized", "quotaExhausted":
+	default:
+		status = ""
+	}
+	priority := strings.TrimSpace(values.Get("priority"))
+	if priority == "all" {
+		priority = ""
+	}
+	return keeperAccountListQuery{
+		Page:          page,
+		PageSize:      pageSize,
+		Keyword:       strings.TrimSpace(values.Get("keyword")),
+		AccountType:   strings.TrimSpace(values.Get("account_type")),
+		Priority:      priority,
+		Status:        status,
+		SortKey:       sortKey,
+		SortDirection: sortDirection,
+	}
+}
+
+func parseKeeperAccountPositiveInt(value string, fallback int) int {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func (a *App) listKeeperAccountsPage(ctx context.Context, query keeperAccountListQuery) (keeperAccountListResult, error) {
+	if query.Page < 1 {
+		query.Page = 1
+	}
+	query.PageSize = clampInt(query.PageSize, 1, keeperAccountsMaxPageSize, keeperAccountsDefaultPageSize)
+	total, enabled, disabled, unauthorized, exhausted, err := a.keeperAccountCounts(ctx, "", nil)
+	if err != nil {
+		return keeperAccountListResult{}, err
+	}
+	where, args := keeperAccountListWhere(query)
+	filteredTotal, filteredEnabled, filteredDisabled, filteredUnauthorized, filteredExhausted, err := a.keeperAccountCounts(ctx, where, args)
+	if err != nil {
+		return keeperAccountListResult{}, err
+	}
+	totalPages := 1
+	if filteredTotal > 0 {
+		totalPages = (filteredTotal + query.PageSize - 1) / query.PageSize
+	}
+	if query.Page > totalPages {
+		query.Page = totalPages
+	}
+
+	accounts, err := a.queryKeeperAccountsPage(ctx, query, where, args)
+	if err != nil {
+		return keeperAccountListResult{}, err
+	}
+	accountTypes, err := a.keeperAccountTypes(ctx)
+	if err != nil {
+		return keeperAccountListResult{}, err
+	}
+	return keeperAccountListResult{
+		Accounts:                  accounts,
+		Total:                     total,
+		FilteredTotal:             filteredTotal,
+		EnabledCount:              enabled,
+		DisabledCount:             disabled,
+		UnauthorizedCount:         unauthorized,
+		QuotaExhaustedCount:       exhausted,
+		FilteredEnabledCount:      filteredEnabled,
+		FilteredDisabledCount:     filteredDisabled,
+		FilteredUnauthorizedCount: filteredUnauthorized,
+		FilteredQuotaExhausted:    filteredExhausted,
+		AccountTypes:              accountTypes,
+		Page:                      query.Page,
+		PageSize:                  query.PageSize,
+		TotalPages:                totalPages,
+	}, nil
+}
+
+func (a *App) keeperAccountCounts(ctx context.Context, where string, args []any) (int, int, int, int, int, error) {
+	query := `
+		SELECT COUNT(*),
+		       COALESCE(SUM(CASE WHEN disabled = 0 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN disabled != 0 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN last_status_code = 401 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN disabled = 0 AND COALESCE(priority, 0) = -1 THEN 1 ELSE 0 END), 0)
+		FROM codex_keeper_auth_states
+	`
+	if strings.TrimSpace(where) != "" {
+		query += " " + where
+	}
+	var total, enabled, disabled, unauthorized, exhausted int
+	err := a.db.QueryRowContext(ctx, query, args...).Scan(&total, &enabled, &disabled, &unauthorized, &exhausted)
+	return total, enabled, disabled, unauthorized, exhausted, err
+}
+
+func (a *App) queryKeeperAccountsPage(ctx context.Context, query keeperAccountListQuery, where string, args []any) ([]keeperAccount, error) {
+	limitArgs := append([]any{}, args...)
+	limitArgs = append(limitArgs, query.PageSize, (query.Page-1)*query.PageSize)
+	sqlText := `
+		SELECT auth_name, email, account_type, disabled, priority, primary_used_percent,
+		       secondary_used_percent, CAST(primary_reset_at AS TEXT), CAST(secondary_reset_at AS TEXT), quota_threshold,
+		       last_status_code, last_error, latest_action, CAST(last_checked_at AS TEXT), CAST(last_healthy_at AS TEXT),
+		       primary_window_seconds, secondary_window_seconds, restore_priority, CAST(created_at AS TEXT), CAST(updated_at AS TEXT)
+		FROM codex_keeper_auth_states
+	`
+	if strings.TrimSpace(where) != "" {
+		sqlText += " " + where
+	}
+	sqlText += " " + keeperAccountListOrderBy(query) + " LIMIT ? OFFSET ?"
+	rows, err := a.db.QueryContext(ctx, sqlText, limitArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	accounts := []keeperAccount{}
+	for rows.Next() {
+		state, err := scanKeeperState(rows)
+		if err != nil {
+			return nil, err
+		}
+		accounts = append(accounts, state.keeperAccount)
+	}
+	return accounts, rows.Err()
+}
+
+func (a *App) keeperAccountTypes(ctx context.Context) ([]string, error) {
+	rows, err := a.db.QueryContext(ctx, `
+		SELECT DISTINCT account_type
+		FROM codex_keeper_auth_states
+		WHERE account_type IS NOT NULL AND TRIM(account_type) != ''
+		ORDER BY account_type COLLATE NOCASE
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	types := []string{}
+	for rows.Next() {
+		var accountType string
+		if err := rows.Scan(&accountType); err != nil {
+			return nil, err
+		}
+		types = append(types, accountType)
+	}
+	return types, rows.Err()
+}
+
+func keeperAccountListWhere(query keeperAccountListQuery) (string, []any) {
+	clauses := []string{}
+	args := []any{}
+	if query.Keyword != "" {
+		keyword := "%" + strings.ToLower(query.Keyword) + "%"
+		clauses = append(clauses, `(LOWER(auth_name) LIKE ? OR LOWER(COALESCE(email, '')) LIKE ?)`)
+		args = append(args, keyword, keyword)
+	}
+	if query.AccountType != "" {
+		clauses = append(clauses, `account_type = ?`)
+		args = append(args, query.AccountType)
+	}
+	switch query.Priority {
+	case "high":
+		clauses = append(clauses, `COALESCE(priority, 0) > 20`)
+	case "minusOne":
+		clauses = append(clauses, `COALESCE(priority, 0) = -1`)
+	case "low":
+		clauses = append(clauses, `COALESCE(priority, 0) < -1`)
+	default:
+		if accountType, ok := strings.CutPrefix(query.Priority, "type:"); ok && strings.TrimSpace(accountType) != "" {
+			clauses = append(clauses, `account_type = ? AND COALESCE(priority, 0) BETWEEN 0 AND 20`)
+			args = append(args, strings.TrimSpace(accountType))
+		}
+	}
+	switch query.Status {
+	case "enabled":
+		clauses = append(clauses, `disabled = 0`)
+	case "disabled":
+		clauses = append(clauses, `disabled != 0`)
+	case "unauthorized":
+		clauses = append(clauses, `last_status_code = 401`)
+	case "quotaExhausted":
+		clauses = append(clauses, `disabled = 0 AND COALESCE(priority, 0) = -1`)
+	}
+	if len(clauses) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(clauses, " AND "), args
+}
+
+func keeperAccountListOrderBy(query keeperAccountListQuery) string {
+	direction := "ASC"
+	if query.SortDirection == "desc" {
+		direction = "DESC"
+	}
+	orderNullable := func(expr string) string {
+		return "ORDER BY (" + expr + ") IS NULL, " + expr + " " + direction + ", COALESCE(email, '') COLLATE NOCASE, auth_name COLLATE NOCASE"
+	}
+	switch query.SortKey {
+	case "quotaDay":
+		return orderNullable(`CASE
+			WHEN disabled != 0 THEN NULL
+			WHEN LOWER(COALESCE(account_type, '')) = 'free' THEN NULL
+			ELSE 100 - primary_used_percent
+		END`)
+	case "quotaWeek":
+		return orderNullable(`CASE
+			WHEN disabled != 0 THEN NULL
+			WHEN LOWER(COALESCE(account_type, '')) = 'free' THEN 100 - primary_used_percent
+			WHEN LOWER(COALESCE(account_type, '')) IN ('plus', 'team') OR LOWER(COALESCE(account_type, '')) LIKE 'pro%' THEN 100 - secondary_used_percent
+			ELSE NULL
+		END`)
+	case "accountType":
+		return orderNullable(`LOWER(account_type)`)
+	case "status":
+		return "ORDER BY disabled " + direction + ", COALESCE(email, '') COLLATE NOCASE, auth_name COLLATE NOCASE"
+	case "priority":
+		return "ORDER BY COALESCE(priority, 0) " + direction + ", COALESCE(email, '') COLLATE NOCASE, auth_name COLLATE NOCASE"
+	case "lastCheckedAt":
+		return orderNullable(`last_checked_at`)
+	default:
+		return "ORDER BY disabled DESC, COALESCE(email, '') COLLATE NOCASE, auth_name COLLATE NOCASE"
+	}
+}
+
 func (a *App) pruneKeeperMissingAuthStates(ctx context.Context, remoteNames map[string]bool) (int, error) {
 	rows, err := a.db.QueryContext(ctx, `SELECT auth_name FROM codex_keeper_auth_states`)
 	if err != nil {
@@ -2860,6 +3191,9 @@ func (a *App) pruneKeeperMissingAuthStates(ctx context.Context, remoteNames map[
 	defer stmt.Close()
 	pruned := 0
 	for _, name := range stale {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM codex_keeper_account_usage_stats WHERE auth_name = ?`, name); err != nil {
+			return 0, err
+		}
 		result, err := stmt.ExecContext(ctx, name)
 		if err != nil {
 			return 0, err
@@ -3021,8 +3355,18 @@ func (a *App) deleteKeeperAccount(ctx context.Context, authName string) error {
 	if err := a.deleteKeeperRemoteAuthFile(ctx, cfg, authName); err != nil {
 		return err
 	}
-	_, err = a.db.ExecContext(ctx, `DELETE FROM codex_keeper_auth_states WHERE auth_name = ?`, authName)
-	return err
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM codex_keeper_account_usage_stats WHERE auth_name = ?`, authName); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM codex_keeper_auth_states WHERE auth_name = ?`, authName); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (a *App) bulkDeleteKeeperAccounts(w http.ResponseWriter, r *http.Request) error {

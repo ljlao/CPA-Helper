@@ -1591,6 +1591,131 @@ func TestKeeperStatusStatsUseLatestDaemonRunOnly(t *testing.T) {
 	}
 }
 
+func TestKeeperUsageStatsAggregatesDailyAndWeeklyByAccount(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+	email := "alpha@example.com"
+	insertKeeperStateForCandidateWithEmail(t, app, "alpha.json", &email, nil, nil)
+	insertKeeperTestPrice(t, app)
+
+	now := time.Date(2026, 6, 1, 10, 0, 0, 0, appTimeLocation)
+	insertKeeperWindowUsageRecord(t, app, keeperWindowUsageSeed{
+		Dedupe:       "today",
+		Timestamp:    now.Add(-2 * time.Hour),
+		Source:       "alpha@example.com",
+		InputTokens:  10,
+		OutputTokens: 5,
+	})
+	insertKeeperWindowUsageRecord(t, app, keeperWindowUsageSeed{
+		Dedupe:       "last-week",
+		Timestamp:    time.Date(2026, 5, 26, 9, 0, 0, 0, appTimeLocation),
+		Source:       "alpha@example.com",
+		InputTokens:  20,
+		OutputTokens: 7,
+	})
+	insertKeeperWindowUsageRecord(t, app, keeperWindowUsageSeed{
+		Dedupe:       "two-weeks-ago",
+		Timestamp:    time.Date(2026, 5, 19, 9, 0, 0, 0, appTimeLocation),
+		Source:       "alpha@example.com",
+		InputTokens:  30,
+		OutputTokens: 9,
+	})
+
+	if err := app.refreshKeeperAccountUsageStats(ctx, now); err != nil {
+		t.Fatalf("refresh usage stats: %v", err)
+	}
+	accounts, err := app.listKeeperAccounts(ctx)
+	if err != nil {
+		t.Fatalf("list accounts: %v", err)
+	}
+	summaries, err := app.keeperUsageStatsSummaries(ctx, accounts, now)
+	if err != nil {
+		t.Fatalf("usage summaries: %v", err)
+	}
+	summary := summaries["alpha.json"]
+	if summary.Today.Records != 1 || summary.ThisWeek.Records != 1 || summary.LastWeek.Records != 1 || summary.TwoWeeksAgo.Records != 1 {
+		t.Fatalf("weekly summary records = today %d this %d last %d two %d, want all 1", summary.Today.Records, summary.ThisWeek.Records, summary.LastWeek.Records, summary.TwoWeeksAgo.Records)
+	}
+	if summary.AllTime.Records != 3 || summary.AllTime.TotalTokens != 81 {
+		t.Fatalf("all time = %d records / %d tokens, want 3 / 81", summary.AllTime.Records, summary.AllTime.TotalTokens)
+	}
+	if summary.ActiveWeeks != 3 || summary.ActiveDays != 3 {
+		t.Fatalf("active periods = %d weeks / %d days, want 3 / 3", summary.ActiveWeeks, summary.ActiveDays)
+	}
+
+	detail, err := app.keeperAccountUsageStats(ctx, "alpha.json", now)
+	if err != nil {
+		t.Fatalf("usage detail: %v", err)
+	}
+	if len(detail.Weekly) < 3 || detail.Weekly[0].Records != 1 {
+		t.Fatalf("weekly detail = %#v, want latest populated week first", detail.Weekly)
+	}
+	if len(detail.Daily) < 3 || detail.Daily[0].Records != 1 {
+		t.Fatalf("daily detail = %#v, want latest populated day first", detail.Daily)
+	}
+}
+
+func TestKeeperAccountListPageFiltersAndPaginates(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+	insertKeeperStateForCandidateWithEmail(t, app, "alpha.json", stringPtr("alpha@example.com"), nil, nil)
+	insertKeeperStateForCandidateWithEmail(t, app, "beta.json", stringPtr("beta@example.com"), nil, nil)
+	insertKeeperStateForCandidateWithEmail(t, app, "gamma.json", stringPtr("gamma@example.com"), nil, nil)
+	if _, err := app.db.Exec(`
+		UPDATE codex_keeper_auth_states
+		SET account_type = CASE auth_name
+			WHEN 'alpha.json' THEN 'plus'
+			WHEN 'beta.json' THEN 'plus'
+			ELSE 'free'
+		END,
+		priority = CASE auth_name
+			WHEN 'alpha.json' THEN 30
+			WHEN 'beta.json' THEN -1
+			ELSE 0
+		END,
+		disabled = CASE auth_name WHEN 'gamma.json' THEN 1 ELSE 0 END,
+		last_status_code = CASE auth_name WHEN 'gamma.json' THEN 401 ELSE NULL END
+	`); err != nil {
+		t.Fatalf("seed keeper account list states: %v", err)
+	}
+
+	result, err := app.listKeeperAccountsPage(ctx, keeperAccountListQuery{
+		Page:          2,
+		PageSize:      1,
+		AccountType:   "plus",
+		Status:        "enabled",
+		SortKey:       "priority",
+		SortDirection: "desc",
+	})
+	if err != nil {
+		t.Fatalf("list keeper accounts page: %v", err)
+	}
+	if result.Total != 3 || result.EnabledCount != 2 || result.DisabledCount != 1 || result.UnauthorizedCount != 1 || result.QuotaExhaustedCount != 1 {
+		t.Fatalf("counts = %#v, want total 3 enabled 2 disabled 1 unauthorized 1 exhausted 1", result)
+	}
+	if result.FilteredTotal != 2 || result.TotalPages != 2 || result.Page != 2 || len(result.Accounts) != 1 {
+		t.Fatalf("page result = %#v, want second page of two filtered accounts", result)
+	}
+	if result.Accounts[0].Name != "beta.json" {
+		t.Fatalf("page account = %q, want beta.json", result.Accounts[0].Name)
+	}
+	assertStringSet(t, result.AccountTypes, []string{"free", "plus"})
+}
+
 func configureKeeperTestCPA(t *testing.T, app *App, url string, mutate func(*AppConfig)) {
 	t.Helper()
 	ctx := context.Background()

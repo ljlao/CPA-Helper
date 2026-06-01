@@ -53,6 +53,7 @@ type App struct {
 	frontendEnv      bool
 	collector        *CollectorRunner
 	keeper           *KeeperRunner
+	keeperUsageStats *KeeperUsageStatsRunner
 	keeperUsageCache keeperWindowUsageCache
 }
 
@@ -131,9 +132,11 @@ func New() (*App, error) {
 	}
 	app.collector = NewCollectorRunner(app)
 	app.keeper = NewKeeperRunner(app)
+	app.keeperUsageStats = NewKeeperUsageStatsRunner(app)
 	app.collector.Start()
 	app.keeper.LoadPersistedState(context.Background())
 	app.keeper.StartAutoIfConfigured()
+	app.keeperUsageStats.Start()
 	return app, nil
 }
 
@@ -143,6 +146,9 @@ func (a *App) Close() {
 	}
 	if a.keeper != nil {
 		a.keeper.Stop()
+	}
+	if a.keeperUsageStats != nil {
+		a.keeperUsageStats.Stop()
 	}
 	if a.db != nil {
 		a.db.Close()

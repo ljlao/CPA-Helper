@@ -4,6 +4,8 @@ import type {
   CodexKeeperBulkDeleteResponse,
   CodexKeeperCronPreviewPayload,
   CodexKeeperCronPreviewResponse,
+  CodexKeeperAccountUsageStats,
+  CodexKeeperAccountsQuery,
   CodexKeeperAccountsResponse,
   CodexKeeperRefreshPayload,
   CodexKeeperSettings,
@@ -31,8 +33,27 @@ export function getCodexKeeperStatus(): Promise<CodexKeeperStatus> {
   return apiClient.get<CodexKeeperStatus>('/codex-keeper/status')
 }
 
-export function listCodexKeeperAccounts(): Promise<CodexKeeperAccountsResponse> {
-  return apiClient.get<CodexKeeperAccountsResponse>('/codex-keeper/accounts')
+export function listCodexKeeperAccounts(
+  query: CodexKeeperAccountsQuery = {},
+): Promise<CodexKeeperAccountsResponse> {
+  return apiClient.get<CodexKeeperAccountsResponse>('/codex-keeper/accounts', {
+    page: query.page,
+    page_size: query.page_size,
+    keyword: query.keyword,
+    account_type: query.account_type,
+    priority: query.priority,
+    status: query.status,
+    sort_key: query.sort_key,
+    sort_direction: query.sort_direction,
+  })
+}
+
+export function getCodexKeeperAccountUsageStats(
+  authName: string,
+): Promise<CodexKeeperAccountUsageStats> {
+  return apiClient.get<CodexKeeperAccountUsageStats>(
+    `/codex-keeper/accounts/${encodeURIComponent(authName)}/usage-stats`,
+  )
 }
 
 export function runCodexKeeperOnce(): Promise<void> {

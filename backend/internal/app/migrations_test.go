@@ -83,13 +83,22 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	if testColumnExists(t, app.db, "user_quota_charges", "total_deducted_usd") {
 		t.Fatal("old user_quota_charges.total_deducted_usd should not exist")
 	}
+	if !testTableExists(t, app.db, "codex_keeper_account_usage_stats") {
+		t.Fatal("codex_keeper_account_usage_stats was not created")
+	}
+	if !testColumnExists(t, app.db, "codex_keeper_account_usage_stats", "period_type") {
+		t.Fatal("codex_keeper_account_usage_stats.period_type was not created")
+	}
+	if !testColumnExists(t, app.db, "codex_keeper_account_usage_stats", "estimated_cost_usd") {
+		t.Fatal("codex_keeper_account_usage_stats.estimated_cost_usd was not created")
+	}
 
 	var version int64
 	if err := app.db.QueryRow(`SELECT MAX(version_id) FROM goose_db_version`).Scan(&version); err != nil {
 		t.Fatalf("query goose version: %v", err)
 	}
-	if version != 202605310002 {
-		t.Fatalf("goose version = %d, want 202605310002", version)
+	if version != 202606010002 {
+		t.Fatalf("goose version = %d, want 202606010002", version)
 	}
 }
 
