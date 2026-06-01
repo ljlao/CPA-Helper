@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"database/sql"
 	"os"
 	"path/filepath"
@@ -109,6 +110,103 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	}
 	if settingsCount != 1 {
 		t.Fatalf("app_settings singleton count = %d, want 1", settingsCount)
+	}
+}
+
+func TestRunMigrationsUpgradesForkDatabasePastUpstreamSeedMigration(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+	dbDir := filepath.Join(dataDir, "db")
+	if err := ensureTestDir(dbDir); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", filepath.Join(dbDir, "cpa_helper.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	setupSQL := []string{
+		`CREATE TABLE app_settings (
+			id INTEGER PRIMARY KEY,
+			collector_enabled BOOLEAN NOT NULL DEFAULT 0,
+			cliaproxy_url VARCHAR(500) NOT NULL DEFAULT 'http://127.0.0.1:8317',
+			management_key VARCHAR(1000) NOT NULL DEFAULT '',
+			queue_name VARCHAR(120) NOT NULL DEFAULT 'usage',
+			batch_size INTEGER NOT NULL DEFAULT 100,
+			poll_interval_seconds REAL NOT NULL DEFAULT 2.0,
+			retry_interval_seconds REAL NOT NULL DEFAULT 10.0,
+			codex_keeper_settings TEXT NOT NULL DEFAULT '{}',
+			codex_keeper_priority_rules TEXT NOT NULL DEFAULT '{}',
+			litellm_proxy_enabled BOOLEAN NOT NULL DEFAULT 0,
+			litellm_proxy_url VARCHAR(500) NOT NULL DEFAULT '',
+			model_request_url VARCHAR(500) NOT NULL DEFAULT 'http://127.0.0.1:8317',
+			session_secret VARCHAR(200) NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		)`,
+		`CREATE TABLE goose_db_version (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			version_id INTEGER NOT NULL,
+			is_applied BOOLEAN NOT NULL,
+			tstamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`INSERT INTO goose_db_version (version_id, is_applied) VALUES (0, 1)`,
+	}
+	for _, statement := range setupSQL {
+		if _, err := db.Exec(statement); err != nil {
+			_ = db.Close()
+			t.Fatalf("setup fork schema: %v", err)
+		}
+	}
+	appliedVersions := []int64{
+		202605160001,
+		202605160002,
+		202605160003,
+		202605180001,
+		202605190001,
+		202605190002,
+		202605200001,
+		202605200002,
+		202605200003,
+		202605200004,
+		202605280001,
+		202605310001,
+		202605310002,
+		202606010001,
+		202606010002,
+	}
+	for _, version := range appliedVersions {
+		if _, err := db.Exec(`INSERT INTO goose_db_version (version_id, is_applied) VALUES (?, 1)`, version); err != nil {
+			_ = db.Close()
+			t.Fatalf("record applied version %d: %v", version, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	app, err := NewWithOptions(context.Background(), NewOptions{
+		Migrate:         true,
+		StartBackground: false,
+	})
+	if err != nil {
+		t.Fatalf("NewWithOptions() failed: %v", err)
+	}
+	defer app.Close()
+
+	var version int64
+	if err := app.db.QueryRow(`SELECT MAX(version_id) FROM goose_db_version`).Scan(&version); err != nil {
+		t.Fatalf("query goose version: %v", err)
+	}
+	if version != backendMigrations.LatestVersion {
+		t.Fatalf("goose version = %d, want %d", version, backendMigrations.LatestVersion)
+	}
+	var settingsCount int
+	if err := app.db.QueryRow(`SELECT COUNT(*) FROM app_settings WHERE id = 1`).Scan(&settingsCount); err != nil {
+		t.Fatalf("query app settings: %v", err)
+	}
+	if settingsCount != 1 {
+		t.Fatalf("app_settings count = %d, want 1", settingsCount)
 	}
 }
 
