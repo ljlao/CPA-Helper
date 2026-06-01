@@ -104,6 +104,7 @@ const ACCOUNT_TABLE_MAX_HEIGHT = 'min(620px, max(320px, calc(100dvh - 430px)))'
 const ACCOUNT_TABLE_VIRTUAL_THRESHOLD = 200
 const CODEX_FIVE_HOUR_WINDOW_SECONDS = 5 * 60 * 60
 const CODEX_WEEK_WINDOW_SECONDS = 7 * 24 * 60 * 60
+const CODEX_MONTH_WINDOW_SECONDS = 30 * 24 * 60 * 60
 const disabledTableScrollX = 1662
 const normalTableScrollX = 2176
 const KEEPER_STATUS_POLL_INTERVAL_MS = 3000
@@ -225,7 +226,7 @@ const accountListViewOptions = [
 ]
 const quotaSortOptions = [
   { label: '天', key: 'quotaDay' },
-  { label: '周', key: 'quotaWeek' },
+  { label: '月/周', key: 'quotaWeek' },
 ]
 
 const accountTypeOptions = computed(() =>
@@ -374,7 +375,7 @@ const activeQuotaSortLabel = computed(() => {
     return '天'
   }
   if (accountSort.key === 'quotaWeek') {
-    return '周'
+    return '月/周'
   }
   return ''
 })
@@ -671,14 +672,14 @@ function isPaidQuotaWindow(account: CodexKeeperAccount): boolean {
 function isFreeQuotaWindow(account: CodexKeeperAccount): boolean {
   return (
     isFreeQuotaWindowAccount(account.account_type) ||
-    (quotaWindowSecondsFor(account, 'primary') === CODEX_WEEK_WINDOW_SECONDS &&
+    (quotaWindowSecondsFor(account, 'primary') === CODEX_MONTH_WINDOW_SECONDS &&
       quotaWindowSecondsFor(account, 'secondary') === null)
   )
 }
 
 function quotaWindowLabels(account: CodexKeeperAccount): { primary: string; secondary: string } {
   if (isFreeQuotaWindow(account)) {
-    return { primary: '周限额', secondary: '次限额' }
+    return { primary: '月限额', secondary: '次限额' }
   }
   if (isPaidQuotaWindow(account)) {
     return { primary: '5小时限额', secondary: '周限额' }

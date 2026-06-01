@@ -32,6 +32,7 @@ const (
 	keeperWeekWindowSeconds        = 7 * 24 * 60 * 60
 	keeperAccountsDefaultPageSize  = 200
 	keeperAccountsMaxPageSize      = 500
+	keeperMonthWindowSeconds       = 30 * 24 * 60 * 60
 )
 
 type KeeperRunner struct {
@@ -1245,6 +1246,7 @@ func (a *App) computeKeeperQuotaWindowUsages(ctx context.Context, accounts []kee
 	sourceAccounts := map[string]string{}
 	aliases := map[string][]string{}
 	var minStart, maxEnd time.Time
+	maxWindowSeconds := 0
 
 	for _, account := range accounts {
 		addKeeperAuthAlias(aliases, account.Name, account.Name)
@@ -1264,15 +1266,22 @@ func (a *App) computeKeeperQuotaWindowUsages(ctx context.Context, accounts []kee
 		usages[account.Name] = pair
 		minStart, maxEnd = keeperQuotaWindowBounds(minStart, maxEnd, pair.Primary)
 		minStart, maxEnd = keeperQuotaWindowBounds(minStart, maxEnd, pair.Secondary)
+		for _, usage := range []*keeperQuotaWindowUsage{pair.Primary, pair.Secondary} {
+			if usage != nil && usage.WindowSeconds > maxWindowSeconds {
+				maxWindowSeconds = usage.WindowSeconds
+			}
+		}
 	}
 	if minStart.IsZero() || maxEnd.IsZero() {
 		return usages, nil
 	}
 
 	queryStart := minStart
-	maxLookbackStart := now.Add(-time.Duration(keeperWeekWindowSeconds) * time.Second)
-	if queryStart.Before(maxLookbackStart) {
-		queryStart = maxLookbackStart
+	if maxWindowSeconds > 0 {
+		maxLookbackStart := now.Add(-time.Duration(maxWindowSeconds) * time.Second)
+		if queryStart.Before(maxLookbackStart) {
+			queryStart = maxLookbackStart
+		}
 	}
 	records, err := a.keeperUsageRecordsInRange(ctx, queryStart, maxEnd)
 	if err != nil {
@@ -1342,7 +1351,7 @@ func keeperQuotaWindowSeconds(accountType *string, saved *int, primary bool) (in
 		return *saved, "codex", true
 	}
 	if keeperFreeQuotaWindowAccount(accountType) {
-		return keeperWeekWindowSeconds, "inferred", true
+		return keeperMonthWindowSeconds, "inferred", true
 	}
 	if keeperPaidQuotaWindowAccount(accountType) {
 		if primary {

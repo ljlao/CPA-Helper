@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	backendMigrations "cpa-helper/backend/migrations"
 )
 
 func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
@@ -97,8 +99,16 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	if err := app.db.QueryRow(`SELECT MAX(version_id) FROM goose_db_version`).Scan(&version); err != nil {
 		t.Fatalf("query goose version: %v", err)
 	}
-	if version != 202606010002 {
-		t.Fatalf("goose version = %d, want 202606010002", version)
+	if version != backendMigrations.LatestVersion {
+		t.Fatalf("goose version = %d, want %d", version, backendMigrations.LatestVersion)
+	}
+
+	var settingsCount int
+	if err := app.db.QueryRow(`SELECT COUNT(*) FROM app_settings WHERE id = 1`).Scan(&settingsCount); err != nil {
+		t.Fatalf("query app_settings singleton: %v", err)
+	}
+	if settingsCount != 1 {
+		t.Fatalf("app_settings singleton count = %d, want 1", settingsCount)
 	}
 }
 

@@ -216,8 +216,14 @@ func TestKeeperLogsUseStandardFileFormatAndCanBeCleared(t *testing.T) {
 	}
 	assertStandardKeeperLogLine(t, status.Logs[len(status.Logs)-1])
 
-	logPath := filepath.Join(dataDir, "logs", "codex-keeper-"+time.Now().Format("2006-01-02")+".log")
-	contents, err := os.ReadFile(logPath)
+	matches, err := filepath.Glob(filepath.Join(dataDir, "logs", "codex-keeper-*.log"))
+	if err != nil {
+		t.Fatalf("glob keeper log files: %v", err)
+	}
+	if len(matches) == 0 {
+		t.Fatal("keeper log file was not created")
+	}
+	contents, err := os.ReadFile(matches[0])
 	if err != nil {
 		t.Fatalf("read keeper log file: %v", err)
 	}
@@ -228,7 +234,7 @@ func TestKeeperLogsUseStandardFileFormatAndCanBeCleared(t *testing.T) {
 	assertStandardKeeperLogLine(t, strings.TrimSpace(fileLines[len(fileLines)-1]))
 
 	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/logs/clear", nil, cookies, nil)
-	matches, err := filepath.Glob(filepath.Join(dataDir, "logs", "codex-keeper-*.log"))
+	matches, err = filepath.Glob(filepath.Join(dataDir, "logs", "codex-keeper-*.log"))
 	if err != nil {
 		t.Fatalf("glob keeper log files: %v", err)
 	}
