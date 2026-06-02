@@ -71,12 +71,32 @@ try {
     localizedServerMessage('巡检完成：健康 1，坏凭证禁用 2，恢复启用 3，优先级降级 4，网络错误 5，缓存跳过 6'),
     'Inspection complete: 1 healthy, 2 bad credentials disabled, 3 restored, 4 priorities lowered, 5 network errors, 6 skipped by cache',
   )
+  assert.equal(
+    localizedServerMessage('Codex Keeper 已开始按计划自动巡检'),
+    'Codex Keeper scheduled automatic inspection started',
+  )
+  assert.equal(
+    localizedServerMessage('Codex Keeper 已停止自动巡检'),
+    'Codex Keeper automatic inspection stopped',
+  )
+  assert.equal(
+    localizedServerMessage('codex@example.com-plus.json: 降为低优先级：额度使用率达到阈值 100%'),
+    'codex@example.com-plus.json: Lowered priority: quota usage reached the 100% threshold',
+  )
+  assert.equal(
+    localizedServerMessage('codex@example.com-plus.json: 已启用 WebSocket 传输'),
+    'codex@example.com-plus.json: enabled WebSocket transport',
+  )
   assert.equal(localizedKeeperStatusDetail('守护运行中'), 'Automatic inspection running')
 
   setLanguage('zh')
   assert.equal(localizedApiErrorMessage('validation_error', null), '请求参数无效')
   assert.equal(localizedApiErrorMessage(null, null), '请求失败')
   assert.equal(localizedKeeperStatusDetail('守护运行中'), '自动巡检运行中')
+  const { formatCompact } = await server.ssrLoadModule('/src/shared/utils/format.ts')
+  assert.equal(formatCompact(12_300), '12.3K')
+  assert.equal(formatCompact(52_646_000), '52.6M')
+  assert.equal(formatCompact(3_560_000_000), '3.6B')
 
   let browserCase = await loadI18nWithBrowserStubs({
     browserLanguages: ['fr-FR', 'zh-CN', 'en-US'],

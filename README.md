@@ -1,12 +1,12 @@
 <div align="center">
   <img src="frontend/public/logo.png" alt="CPA-Helper Logo" width="104" height="104" />
   <h1>CPA-Helper</h1>
-  <p><strong>面向 CLIProxyAPI 的本地自托管多用户管理面板</strong></p>
-  <p>用量统计 · 请求追踪 · 用户余额 · API 密钥管理 · 模型价格维护 · Codex 凭证巡检</p>
+  <p><strong>A local self-hosted multi-user admin panel for CLIProxyAPI</strong></p>
+  <p>Usage analytics · Request tracing · User balances · API key management · Model pricing maintenance · Codex auth file inspection</p>
   <p>
-    <a href="README.en.md">English</a>
+    <strong>English</strong>
     <span> · </span>
-    <strong>中文</strong>
+    <a href="README.zh-CN.md">中文</a>
   </p>
   <p>
     <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go&logoColor=white" alt="Go 1.25+" /></a>
@@ -19,165 +19,165 @@
 
 ---
 
-CPA-Helper 是面向 CLIProxyAPI / CPA 用户的本地自托管多用户管理面板，用于集中管理用量统计、请求明细、用户账号、API Key、模型价格、可用模型以及 Codex auth file 巡检维护。
+CPA-Helper is a local self-hosted multi-user administration panel for CLIProxyAPI / CPA users. It centralizes usage analytics, request records, user accounts, API keys, model pricing, available models and Codex auth file inspection.
 
-它支持按用户隔离 API Key 与用量数据：每个用户都可以独立创建和管理自己的 Key，并查看属于自己的请求、Token 与费用统计；管理员可以创建或禁用普通用户账号，查看全局用量和用户维度明细，适合个人、小团队或共享 CPA 服务的内网场景。项目采用 Go + SQLite + Vue 3 + Vite 构建，默认将运行数据写入仓库根目录的 `data/` 目录。
+It separates API keys and usage data by user: each user can create and manage their own keys and inspect their own requests, tokens and cost statistics, while administrators can create or disable regular accounts and review global plus per-user usage. It is built with Go, SQLite, Vue 3 and Vite, with runtime data stored in the root-level `data/` directory by default.
 
-需要说明的是，Agent 发起的模型请求仍由 Agent 直接发送到 CPA，CPA-Helper 不代理或中转这些请求；它只调用 CPA 的 usage 队列、API KEY 创建与删除、凭证管理等接口，用于用量查看、密钥管理和凭证维护。
+For clarity, model requests initiated by an Agent are still sent directly from that Agent to CPA. CPA-Helper does not proxy or relay those requests; it only calls CPA management-style interfaces such as the usage queue, API key creation and deletion, and credential management for usage views, key management and credential maintenance.
 
-## 目录
+## Table of Contents
 
-- [项目特点](#项目特点)
-- [截图预览](#截图预览)
-- [技术栈](#技术栈)
-- [目录结构](#目录结构)
-- [环境要求](#环境要求)
-- [快速开始](#快速开始)
-- [配置说明](#配置说明)
-- [开发与检查](#开发与检查)
-- [贡献](#贡献)
-- [致谢](#致谢)
-- [许可证](#许可证)
+- [Features](#features)
+- [Screenshots](#screenshots)
+- [Tech Stack](#tech-stack)
+- [Project Structure](#project-structure)
+- [Requirements](#requirements)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Development and Checks](#development-and-checks)
+- [Contributing](#contributing)
+- [Acknowledgements](#acknowledgements)
+- [License](#license)
 
-## 项目特点
+## Features
 
-- **用量统计与费用估算**：按全局、用户和当前账号视角统计请求数、Token、成功率、延迟、模型分布和费用，并提供趋势图、排行榜和筛选视图。
-- **请求明细追踪**：管理员可按时间、用户、API Key 描述、服务商、模型、接口和失败状态筛选全局请求；普通用户只查看自己账号下的请求详情。
-- **用户与权限管理**：支持管理员和普通用户视图，管理员可创建、禁用普通用户账号，并维护用户昵称、登录账号、密码和角色。
-- **用户余额与 Key 自动暂停**：用户默认不限制余额；管理员可设置每月余额和不限时余额，用量按当前模型价格折算为 USD，优先扣每月余额，不足再扣不限时余额，余额耗尽后只暂停该用户的 CPA API Key。
-- **API Key 生命周期管理**：每个用户都可以独立创建、编辑、复制和删除自己的 API Key，并同步到 CPA；用量会按用户维度独立统计和展示，每个 Key 都提供请求说明和真实请求测试。
-- **模型价格维护**：Token 模型按 USD / 百万 Token 维护输入、输出、缓存价格；模型名包含 `image` 的模型按每次成功调用固定 USD 计费，并可对照 CPA 当前可用模型快速补齐或调整本地 LiteLLM / 手动价格。
-- **可用模型聚合查询**：通过当前账号绑定的 CPA API Key 查询可用模型，并关联本地价格信息。
-- **CLIProxyAPI / CPAMC 集成**：配置服务地址、管理密钥、usage 队列和本地采集参数，将远端 usage 事件落入本地 SQLite。
-- **Codex auth file 巡检**：支持 Cron 调度、额度阈值、只检查不修改、按条件扫描、并发 Worker、优先级规则、账号启停和删除维护。
-- **本地优先的数据策略**：默认使用 SQLite 和 `data/` 目录，支持通过 `CPA_HELPER_DATA_DIR` 覆盖运行数据路径。
-- **现代化管理界面**：基于 Vue 3、Naive UI、ECharts 和 lucide 图标，支持浅色、暗色和跟随系统主题。
+- **Usage analytics and cost estimation**: Track requests, tokens, success rate, latency, model distribution and estimated cost from global, per-user and current-account views.
+- **Request record tracing**: Admins can filter global request events by time, user, API key description, provider, model, endpoint and failure state; regular users inspect only their own account records.
+- **User and permission management**: Provide administrator and regular-user views; admins can create or disable regular accounts and manage nicknames, login accounts, passwords and roles.
+- **User balances and automatic key pause**: Users are unlimited by default; admins can configure monthly balance and lifetime balance, usage is priced in USD with current model prices, monthly balance is consumed first, and exhausted users only have their CPA API keys paused.
+- **API key lifecycle management**: Each user can independently create, edit, copy and delete their own API keys and synchronize them to CPA, with usage counted per user and per-key request guidance plus live request testing.
+- **Model pricing maintenance**: Maintain token-model input, output and cache prices in USD per million tokens; models whose name contains `image` are charged by a fixed USD price per successful request, with CPA model comparison for quickly filling LiteLLM / manual prices.
+- **Available model aggregation**: Query available models through the current account's bound CPA API keys and enrich them with local pricing data.
+- **CLIProxyAPI / CPAMC integration**: Configure the service URL, management key, usage queue and local collector options to persist remote usage events into SQLite.
+- **Codex auth file inspection**: Support Cron scheduling, quota thresholds, check-only mode, conditional scanning, concurrent workers, priority rules, account enable/disable and deletion.
+- **Local-first data storage**: Use SQLite and the `data/` directory by default, with `CPA_HELPER_DATA_DIR` available for overriding the runtime data path.
+- **Modern admin interface**: Built with Vue 3, Naive UI, ECharts and lucide icons, with light, dark and system theme modes.
 
-## 截图预览
+## Screenshots
 
-### 管理端
+### Admin
 
-**历史用量**
+**Usage dashboard**
 
-管理员可按时间、用户、模型和接口查看全局请求量、Token、费用、趋势和分布。
+Admins can inspect global request volume, tokens, cost, trends and distributions by time range, user, model and endpoint.
 
-![历史用量](pictures/历史用量.png)
+![Usage dashboard](pictures/历史用量.png)
 
-**请求明细**
+**Request records**
 
-管理员可筛选全局请求事件，普通用户可查看自己账号下的请求明细；详情以抽屉方式呈现。
+Admins can filter global request events, while regular users can inspect records scoped to their own account, with drawer-based detail views.
 
-![请求明细](pictures/请求明细.png)
+![Request records](pictures/请求明细.png)
 
-**用户管理**
+**User management**
 
-管理员可创建或禁用普通用户账号，维护昵称、角色、启停状态，并查看用户维度的今日用量、每月余额和不限时余额。
+Admins can create or disable regular accounts, manage nicknames, roles and enabled status, and review per-user daily usage, monthly balance and lifetime balance.
 
-![用户管理](pictures/用户管理.png)
+![User management](pictures/用户管理.png)
 
-**模型价格**
+**Model pricing**
 
-查看 CPA 当前可用模型与本地价格库的差异，快速为未定价模型补价，并按当前价格实时估算历史请求费用。
+Compare CPA's currently available models with the local price catalog, quickly price missing models, and recalculate historical request costs using the latest configured prices.
 
-![模型价格](pictures/模型价格.png)
+![Model pricing](pictures/模型价格.png)
 
-**系统设置**
+**System settings**
 
-集中配置 CLIProxyAPI / CPAMC 地址、模型请求地址、管理密钥、本地采集和轮询参数。
+Configure the CLIProxyAPI / CPAMC endpoint, model request URL, management key, local collector and polling options.
 
-![系统设置](pictures/系统设置.png)
+![System settings](pictures/系统设置.png)
 
-### 账号巡检
+### Account Inspection
 
-**巡检设置**
+**Inspection settings**
 
-配置 Codex auth file 巡检的 Cron 调度、额度阈值、按条件扫描、超时、重试、Worker 数和优先级规则。
+Configure Codex auth file inspection with Cron schedules, quota thresholds, conditional scanning, timeouts, retries, worker count and priority rules.
 
-![巡检设置](pictures/巡检设置.png)
+![Inspection settings](pictures/巡检设置.png)
 
-**账号状态**
+**Account status**
 
-查看 auth file 健康状态、额度窗口、账号类型、优先级和最近巡检维护结果。
+Review auth file health, quota windows, account types, priorities and the latest inspection actions.
 
-![账号状态](pictures/账号状态.png)
+![Account status](pictures/账号状态.png)
 
-### 个人视图
+### Account Views
 
-**我的账户**
+**My usage**
 
-每个用户可查看自己的请求量、Token、费用、趋势、模型使用情况和当前余额状态。
+Each user can review their own requests, tokens, costs, trends, model usage and current balance state.
 
-![我的账户](pictures/我的账户.png)
+![My usage](pictures/我的账户.png)
 
-**我的明细**
+**My records**
 
-每个用户可查看自己账号下的请求事件和详情，不与其他用户混在一起。
+Each user can inspect request events and details scoped to their own account, separated from other users.
 
-![我的明细](pictures/我的明细.png)
+![My records](pictures/我的明细.png)
 
-**API 密钥**
+**API keys**
 
-当前账号可独立创建和管理自己的 API Key，查看今日请求、Token、费用和余额概览，并对单个 Key 生成请求示例或发起真实请求测试。
+Each account can independently create and manage its own API keys, review daily request, token, cost and balance summaries, and generate examples or run a live test request for each key.
 
-![API密钥](pictures/API密钥.png)
+![API keys](pictures/API密钥.png)
 
-**可用模型**
+**Available models**
 
-通过绑定的 CPA API Key 查询可用模型，并展示模型可用状态与本地价格信息。
+Query available models through bound CPA API keys and display availability plus local pricing information.
 
-![可用模型](pictures/可用模型.png)
+![Available models](pictures/可用模型.png)
 
-**账户设置**
+**Account settings**
 
-查看当前登录账号并更新密码。
+View the current signed-in account and update the password.
 
-![账户设置](pictures/账户设置.png)
+![Account settings](pictures/账户设置.png)
 
-## 技术栈
+## Tech Stack
 
-- **后端**：Go 标准库 HTTP、SQLite、robfig/cron、modernc.org/sqlite。
-- **前端**：Vue 3、Vite、TypeScript、Vue Router、Naive UI、ECharts、lucide-vue-next。
-- **运行数据**：默认写入根目录 `data/`，SQLite 数据库位于 `data/db/cpa_helper.sqlite3`。
-- **接口风格**：后端统一提供 `/api/*` 接口，前端开发服务器通过 Vite proxy 转发到 `http://127.0.0.1:18317`。
+- **Backend**: Go standard-library HTTP server, SQLite, robfig/cron and modernc.org/sqlite.
+- **Frontend**: Vue 3, Vite, TypeScript, Vue Router, Naive UI, ECharts and lucide-vue-next.
+- **Runtime data**: Stored in root-level `data/` by default; the SQLite database is `data/db/cpa_helper.sqlite3`.
+- **API shape**: The backend exposes `/api/*`; the Vite development server proxies API calls to `http://127.0.0.1:18317`.
 
-## 目录结构
+## Project Structure
 
 ```text
 CPA-Helper/
-├── backend/                 # Go 后端项目
-│   ├── cmd/cpa-helper/      # 应用入口
-│   ├── internal/app/        # 应用组合、路由、业务处理、数据库访问
-│   ├── internal/httpserver/ # HTTP server 生命周期与优雅退出
-│   ├── internal/platform/   # 外部系统基础设施适配
-│   ├── internal/security/   # 密码、Session、API Key 安全工具
-│   ├── migrations/          # 内嵌 goose SQLite 迁移
+├── backend/                 # Go backend project
+│   ├── cmd/cpa-helper/      # Application entrypoint
+│   ├── internal/app/        # App composition, routes, business logic and database access
+│   ├── internal/httpserver/ # HTTP server lifecycle and graceful shutdown
+│   ├── internal/platform/   # External-system infrastructure adapters
+│   ├── internal/security/   # Password, session and API-key security helpers
+│   ├── migrations/          # Embedded goose SQLite migrations
 │   ├── go.mod
 │   └── go.sum
-├── frontend/                # Vue + Vite 前端项目
-│   ├── src/                 # 应用、功能模块、共享组件与样式
-│   ├── public/              # 静态资源
-│   └── package.json         # 前端依赖与脚本
-├── pictures/                # README 截图素材
-├── docs/                    # 参考文档
-├── data/                    # 运行时数据目录，默认不提交
-├── VERSION                  # 应用版本号，Docker 标签和前端显示共用
+├── frontend/                # Vue + Vite frontend project
+│   ├── src/                 # App, feature modules, shared utilities and styles
+│   ├── public/              # Static assets
+│   └── package.json         # Frontend dependencies and scripts
+├── pictures/                # README screenshots
+├── docs/                    # Reference documentation
+├── data/                    # Runtime data, ignored by Git by default
+├── VERSION                  # Shared app version for Docker tags and frontend display
 ├── README.md
-├── README.en.md
+├── README.zh-CN.md
 └── LICENSE
 ```
 
-## 环境要求
+## Requirements
 
-- Go 1.25 或更高版本。
-- Node.js 20 或更高版本。
-- npm。
-- 一个可访问的 CLIProxyAPI / CPA 服务。默认地址为 `http://127.0.0.1:8317`。
+- Go 1.25 or newer.
+- Node.js 20 or newer.
+- npm.
+- An accessible CLIProxyAPI / CPA service. The default URL is `http://127.0.0.1:8317`.
 
-## 快速开始
+## Quick Start
 
-### 1. Docker Compose 部署（推荐）
+### 1. Docker Compose deployment (recommended)
 
-在部署目录创建 `docker-compose.yml`：
+Create `docker-compose.yml` in the deployment directory:
 
 ```yaml
 services:
@@ -194,31 +194,31 @@ services:
       - ./data:/app/data
 ```
 
-然后直接拉取镜像并启动：
+Then pull the image and start the service:
 
 ```powershell
 docker compose pull
 docker compose up -d
 ```
 
-访问：
+Open:
 
 ```text
 http://127.0.0.1:18317
 ```
 
-首次访问时，系统会引导创建第一个管理员账号。
+On first visit, the application guides you through creating the first administrator account.
 
-### 2. 克隆项目
+### 2. Clone the repository
 
 ```powershell
 git clone <your-repo-url>
 cd CPA-Helper
 ```
 
-### 3. 启动后端
+### 3. Start the backend
 
-所有后端命令都在 `backend/` 目录运行：
+Run all backend commands from `backend/`:
 
 ```powershell
 cd backend
@@ -226,37 +226,38 @@ go mod download
 go run ./cmd/cpa-helper
 ```
 
-后端可执行文件也提供显式运维子命令：
+The binary also exposes explicit operational subcommands:
 
 ```powershell
-go run ./cmd/cpa-helper migrate  # 只运行数据库迁移并退出
-go run ./cmd/cpa-helper serve    # 只在只读启动检查通过后启动服务
-go run ./cmd/cpa-helper doctor   # 只运行只读启动检查并退出
+go run ./cmd/cpa-helper migrate  # run database migrations and exit
+go run ./cmd/cpa-helper serve    # start only after read-only startup checks pass
+go run ./cmd/cpa-helper doctor   # run read-only startup checks and exit
 ```
 
-不带子命令运行是面向用户的默认启动路径：先迁移数据库，再执行就绪检查，然后启动服务。
+Running without a subcommand is the user-facing startup path: it runs migrations,
+checks readiness, and then starts the service.
 
-如需本地编译二进制，输出到已忽略的 `backend/bin/`：
+For a local binary build, write the output to the ignored `backend/bin/` directory:
 
 ```powershell
 go build -o bin/cpa-helper.exe ./cmd/cpa-helper
 ```
 
-后端健康检查：
+Health check:
 
 ```powershell
 curl http://127.0.0.1:18317/api/health
 ```
 
-预期返回：
+Expected response:
 
 ```json
 {"status":"ok"}
 ```
 
-### 4. 启动前端开发服务器
+### 4. Start the frontend development server
 
-新开一个终端，在 `frontend/` 目录运行：
+Open a new terminal and run from `frontend/`:
 
 ```powershell
 cd frontend
@@ -264,24 +265,25 @@ npm install
 npm run dev
 ```
 
-如果本机已经有正式后端占用 `18317`，可以把测试后端启动到其他端口，并让 Vite 代理到测试后端：
+If a normal backend is already using `18317`, start the test backend on another
+port and point the Vite proxy to it:
 
 ```powershell
 $env:CPA_HELPER_PROXY_TARGET="http://127.0.0.1:18318"
 npm run dev -- --host 127.0.0.1 --port 5174 --strictPort
 ```
 
-打开浏览器访问：
+Open:
 
 ```text
 http://127.0.0.1:5173
 ```
 
-首次访问时，系统会引导创建第一个管理员账号。
+On first visit, the application guides you through creating the first administrator account.
 
-### 5. 单服务预览或部署
+### 5. Single-service preview or deployment
 
-如果希望由 Go 后端托管前端静态文件，先构建前端：
+To let the Go backend serve the frontend static files, build the frontend first:
 
 ```powershell
 cd frontend
@@ -289,90 +291,92 @@ npm install
 npm run build
 ```
 
-然后启动后端：
+Then start the backend:
 
 ```powershell
 cd ../backend
 go run ./cmd/cpa-helper
 ```
 
-访问：
+Open:
 
 ```text
 http://127.0.0.1:18317
 ```
 
-后端会在 `frontend/dist` 存在时托管构建后的单页应用。
+When `frontend/dist` exists, the backend serves the built single-page application.
 
-## 配置说明
+## Configuration
 
 ### CLIProxyAPI / CPAMC
 
-进入“系统设置”页面后配置：
+Use the System Settings page to configure:
 
-- **CLIProxyAPI / CPAMC 地址**：默认 `http://127.0.0.1:8317`。
-- **模型请求地址**：只用于 API 密钥页“请求测试”生成 Base URL、接口 URL 和示例；不影响采集地址、管理密钥或后端同步逻辑。
-- **管理密钥**：用于访问 CLIProxyAPI Management API。
-- **开启本地采集**：启用后，CPA-Helper 会从 usage 队列读取事件并写入本地数据库。
-- **批量读取数、轮询间隔、重试间隔**：控制本地采集任务的吞吐与失败重试。
+- **CLIProxyAPI / CPAMC URL**: defaults to `http://127.0.0.1:8317`.
+- **Model request URL**: used only by the API Keys page request-test dialog to generate the Base URL, endpoint URL and examples; it does not affect collection, the management key or backend synchronization.
+- **Management key**: used to access the CLIProxyAPI Management API.
+- **Enable local collector**: when enabled, CPA-Helper reads events from the usage queue and writes them to the local database.
+- **Batch size, polling interval and retry interval**: control local collector throughput and failure retry behavior.
 
-### 用户余额
+### User Balances
 
-- 所有现有用户和新建用户默认“不限制余额”。
-- 管理员可在“用户管理”里关闭不限制开关，并设置每月余额与不限时余额；两个数值默认 `0`，且不能留空。
-- 首次设置余额不会追溯历史 usage，只有后续新采集入库的 usage 会参与扣费。
-- 余额扣费使用当前模型价格估算的 USD 金额，顺序固定为先扣每月余额，不足部分再扣不限时余额。
-- 当两类余额都不可用或耗尽时，系统会从 CPA 远端移除该用户本地绑定的 API Key，但不会禁用该用户登录账号；用户仍可登录查看原因。
-- 每月余额按 `Asia/Shanghai` 自然月重置。进入新月份、管理员补充余额或重新打开不限制余额后，仅因余额耗尽暂停的 Key 会自动恢复。
-- 未定价的 usage 不扣余额，但会记录未定价事件，并在管理员和用户自己的余额状态里提示。
+- Existing users and newly created users are unlimited by default.
+- Admins can disable the unlimited toggle in User Management and then set monthly balance plus lifetime balance; both numeric fields default to `0` and cannot be left blank.
+- Initial balance setup does not retroactively charge historical usage; only newly collected usage after setup participates in balance deduction.
+- Balance consumption uses the USD amount estimated from current model prices. The fixed order is monthly balance first, then lifetime balance for any overflow.
+- When both balances are unavailable or exhausted, CPA-Helper removes that user's locally bound API keys from CPA, but it does not disable the login account. The user can still sign in and view the reason.
+- Monthly balance resets by the `Asia/Shanghai` calendar month. Entering a new month, adding balance or switching the user back to unlimited automatically restores keys that were paused only because of balance exhaustion.
+- Unpriced usage does not consume balance, but CPA-Helper records it as an unpriced balance event and surfaces the warning to admins and the affected user.
 
-### 模型价格与请求测试
+### Model Pricing and Request Testing
 
-- “模型价格”页会同时展示 CPA 当前可用模型和本地价格库记录，方便发现未定价模型。
-- Token 模型按 USD / 百万 Token 维护输入、输出、缓存读、缓存写价格；模型名包含 `image` 的模型按每次成功调用固定 USD 计费，未设置每次价格时会被视为未定价。
-- 历史用量页面会按当前价格实时重算展示费用；已经写入的余额扣费流水保留当时计算出的金额，不会因后续改价回算。
-- LiteLLM 同步用于快速补齐价格库，手动价格会优先保留；无法访问 GitHub 时可在模型价格页配置 LiteLLM 代理。
-- API 密钥页每个 Key 都提供“请求测试”，弹窗会展示 Base URL、接口 URL、鉴权 Header、curl 示例，并可真实发送一次测试请求。
-- 请求测试支持 Chat Completions、Responses 和 Claude Messages 三种接口格式，示例和测试请求会随选择自动切换。
+- The Model Pricing page shows CPA's currently available models alongside the local price catalog so missing prices are easy to find.
+- Token models store input, output, cache read and cache write prices as USD per million tokens. Models whose name contains `image` use a fixed USD price per successful request; if that per-request price is missing, the model is treated as unpriced.
+- Usage-history pages recalculate displayed costs with the current price catalog; already written balance charge records keep the amount calculated at the time and are not retroactively repriced.
+- LiteLLM sync can quickly fill the local price catalog while preserving manual prices. If GitHub is not reachable, configure the LiteLLM proxy from the Model Pricing page.
+- Each API key row includes Request Test, which shows the Base URL, endpoint URL, auth header and curl example, and can send one real test request.
+- Request testing supports Chat Completions, Responses and Claude Messages formats. The examples and test payload switch with the selected format.
 
-### 数据目录
+### Data Directory
 
-默认运行数据目录：
+Default runtime data directory:
 
 ```text
 data/
 ```
 
-默认 SQLite 数据库：
+Default SQLite database:
 
 ```text
 data/db/cpa_helper.sqlite3
 ```
 
-可以通过环境变量覆盖运行数据目录：
+Override the runtime data directory with:
 
 ```powershell
 $env:CPA_HELPER_DATA_DIR="<your-data-dir>"
 ```
 
-然后再启动后端服务。
+Then start the backend service.
 
-### 账号巡检
+### Account Inspection
 
-“巡检设置”页面用于维护 Codex auth file：
+The Inspection Settings page manages Codex auth files:
 
-- Cron 表达式决定自动巡检周期。
-- 额度阈值决定何时降级或恢复账号优先级。
-- “只检查不修改”开启时只记录计划操作，不会禁用账号或调整优先级。
-- 按条件扫描会对比本地已记录账号与 CPA 当前账号列表：本地缺少的账号会先请求一次额度并记录，本地多出的账号会移除。
-- 优先级规则按账号类型控制默认调度权重。
-- “账号状态”页面可查看健康、额度、最近巡检、启停状态和手动优先级。
+- Cron expressions define the automatic inspection schedule.
+- Quota thresholds decide when account priority should be degraded or restored.
+- Check-only mode records planned actions without disabling accounts or changing priorities.
+- Conditional scanning compares locally recorded accounts with the current CPA account list: accounts missing locally are queried once for quota and recorded, while accounts no longer present in CPA are removed locally.
+- Priority rules define default scheduling weights by account type.
+- The Account Status page shows health, quota, latest inspection, enabled state and manual priority.
 
-## 开发与检查
+## Development and Checks
 
-### 本地隔离测试
+### Isolated Local Testing
 
-如果本机已经运行正式服务，测试时不要复用正式端口和真实数据目录。建议后端使用临时端口和临时数据目录：
+If a normal service is already running locally, do not reuse its ports or real
+data directory for tests. Start the backend with a temporary port and data
+directory:
 
 ```powershell
 cd backend
@@ -381,7 +385,8 @@ $env:CPA_HELPER_DATA_DIR="$env:TEMP\cpa-helper-test-data"
 go run ./cmd/cpa-helper
 ```
 
-前端测试服务使用独立端口，并把 Vite 代理指向测试后端：
+Run the frontend test server on a separate port and point the Vite proxy at the
+test backend:
 
 ```powershell
 cd frontend
@@ -389,13 +394,19 @@ $env:CPA_HELPER_PROXY_TARGET="http://127.0.0.1:18318"
 npm run dev -- --host 127.0.0.1 --port 5174 --strictPort
 ```
 
-自动化验证默认不要使用真实 CPA 地址和真实管理密钥。涉及自动巡检、账号启停、优先级调整或删除操作时，应使用假的 CLIProxyAPI / CPAMC 测试替身，并优先开启“只检查不修改”；只有明确确认风险后才连接真实 CPA。
+Automated validation should not use a real CPA URL or real management key by
+default. For account inspection, enable/disable, priority changes, or deletion
+flows, use a fake CLIProxyAPI / CPAMC test double and prefer check-only mode;
+connect to real CPA only after the risk is explicitly accepted.
 
-### 版本管理
+### Version Management
 
-项目版本统一写在根目录 `VERSION` 文件中，例如 `0.1.0`。GitHub Actions 会读取它并推送 `walkingd/cpa-helper:v0.1.0` 和 `walkingd/cpa-helper:latest`；前端构建也会读取同一个文件并显示为 `v0.1.0`。
+The project version is stored in the root `VERSION` file, for example `0.1.0`.
+GitHub Actions reads it to push `walkingd/cpa-helper:v0.1.0` and
+`walkingd/cpa-helper:latest`; the frontend build reads the same file and
+displays it as `v0.1.0`.
 
-后端：
+Backend:
 
 ```powershell
 cd backend
@@ -403,7 +414,7 @@ go fmt ./...
 go test ./...
 ```
 
-前端：
+Frontend:
 
 ```powershell
 cd frontend
@@ -411,29 +422,29 @@ npm run lint
 npm run build
 ```
 
-数据库结构：
+Database schema:
 
 ```powershell
 cd backend
 go test ./...
 ```
 
-Go 后端可执行文件提供 `migrate`、`serve` 和 `doctor` 子命令。不带子命令的默认启动路径会先运行内嵌 goose SQLite 迁移再启动服务；`serve` 只执行只读启动检查，数据库缺失或版本落后时会直接失败。迁移文件位于 `backend/migrations/`，不再需要 Alembic。
-Docker 升级时只需要继续挂载旧的 `data/db/cpa_helper.sqlite3`；迁移逻辑已经随 Go 二进制打包，不会读取旧源码目录。
+The Go backend executable provides `migrate`, `serve`, and `doctor` subcommands. The default no-subcommand startup path runs embedded goose SQLite migrations before serving; `serve` performs read-only startup checks and fails if the database is missing or behind. Migration files live in `backend/migrations/`, and Alembic is no longer required.
+For Docker upgrades, keep mounting the existing `data/db/cpa_helper.sqlite3`; migration logic is packaged into the Go binary and does not read the old source tree.
 
-## 贡献
+## Contributing
 
-欢迎提交 Issue 和 Pull Request。建议在提交前完成以下检查：
+Issues and pull requests are welcome. Before submitting changes, please check:
 
-- 后端通过 `go fmt ./...` 和 `go test ./...`。
-- 前端通过 `npm run lint` 和 `npm run build`。
-- 涉及关系型数据库结构变化时，同步新增或更新 `backend/migrations/` 下的 goose 迁移。
-- 不提交本地运行数据、虚拟环境、构建产物或密钥。
+- Backend passes `go fmt ./...` and `go test ./...`.
+- Frontend passes `npm run lint` and `npm run build`.
+- Relational schema changes add or update goose migrations under `backend/migrations/`.
+- Local runtime data, virtual environments, build outputs and secrets are not committed.
 
-## 致谢
+## Acknowledgements
 
-感谢 [Linux.do](https://linux.do/) 站点及其社区为项目开发与交流提供支持与启发。
+Thanks to the [Linux.do](https://linux.do/) site and community for support and inspiration around the project.
 
-## 许可证
+## License
 
-本项目基于 [MIT License](LICENSE) 开源。
+This project is open-sourced under the [MIT License](LICENSE).

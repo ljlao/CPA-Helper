@@ -7,7 +7,7 @@ export function formatInteger(value: number): string {
 }
 
 export function formatCompact(value: number): string {
-  return new Intl.NumberFormat(currentLanguage.value === 'zh' ? 'zh-CN' : 'en-US', {
+  return new Intl.NumberFormat('en-US', {
     notation: 'compact',
     compactDisplay: 'short',
     maximumFractionDigits: 1,
