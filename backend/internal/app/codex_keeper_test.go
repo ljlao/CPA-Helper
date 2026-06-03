@@ -214,16 +214,11 @@ func TestKeeperLogsUseStandardFileFormatAndCanBeCleared(t *testing.T) {
 	if len(status.Logs) == 0 {
 		t.Fatal("status logs are empty, want daemon start log")
 	}
-	assertStandardKeeperLogLine(t, status.Logs[len(status.Logs)-1])
+	lastLog := status.Logs[len(status.Logs)-1]
+	assertStandardKeeperLogLine(t, lastLog)
 
-	matches, err := filepath.Glob(filepath.Join(dataDir, "logs", "codex-keeper-*.log"))
-	if err != nil {
-		t.Fatalf("glob keeper log files: %v", err)
-	}
-	if len(matches) == 0 {
-		t.Fatal("keeper log file was not created")
-	}
-	contents, err := os.ReadFile(matches[0])
+	logPath := filepath.Join(dataDir, "logs", "codex-keeper-"+keeperLogDate(t, lastLog)+".log")
+	contents, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatalf("read keeper log file: %v", err)
 	}
@@ -234,7 +229,7 @@ func TestKeeperLogsUseStandardFileFormatAndCanBeCleared(t *testing.T) {
 	assertStandardKeeperLogLine(t, strings.TrimSpace(fileLines[len(fileLines)-1]))
 
 	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/logs/clear", nil, cookies, nil)
-	matches, err = filepath.Glob(filepath.Join(dataDir, "logs", "codex-keeper-*.log"))
+	matches, err := filepath.Glob(filepath.Join(dataDir, "logs", "codex-keeper-*.log"))
 	if err != nil {
 		t.Fatalf("glob keeper log files: %v", err)
 	}
@@ -1267,6 +1262,14 @@ func assertStandardKeeperLogLine(t *testing.T, line string) {
 	if !pattern.MatchString(line) {
 		t.Fatalf("keeper log line %q does not match standard format", line)
 	}
+}
+
+func keeperLogDate(t *testing.T, line string) string {
+	t.Helper()
+	if len(line) < len("time=2006-01-02") || !strings.HasPrefix(line, "time=") {
+		t.Fatalf("keeper log line %q does not include a leading timestamp", line)
+	}
+	return line[len("time="):len("time=2006-01-02")]
 }
 
 func waitForKeeperAccounts(t *testing.T, handler http.Handler, cookies []*http.Cookie, expected int) keeperAccountsResponse {
