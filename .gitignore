@@ -22,5 +22,6 @@ data/
 *.pyo
 *.pyd
 *.log
+*.tar
 frontend/vite.config.js
 frontend/vite.config.d.ts
