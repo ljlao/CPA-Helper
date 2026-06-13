@@ -3,7 +3,7 @@ package migrations
 import "embed"
 
 // LatestVersion is the newest embedded migration version this binary expects.
-const LatestVersion int64 = 202606020001
+const LatestVersion int64 = 202606110001
 
 // FS contains SQL migrations embedded into the application binary.
 //

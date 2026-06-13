@@ -33,6 +33,8 @@ const (
 	keeperAccountsDefaultPageSize  = 200
 	keeperAccountsMaxPageSize      = 500
 	keeperMonthWindowSeconds       = 30 * 24 * 60 * 60
+	keeperMinMonthWindowSeconds    = 28 * 24 * 60 * 60
+	keeperWindowInferenceTolerance = 5 * time.Minute
 )
 
 type KeeperRunner struct {
@@ -261,7 +263,8 @@ type keeperAuthState struct {
 
 type keeperUsageInfo struct {
 	PlanType               string
-	PrimaryUsedPercent     int
+	QuotaObserved          bool
+	PrimaryUsedPercent     *int
 	SecondaryUsedPercent   *int
 	PrimaryResetAt         *time.Time
 	SecondaryResetAt       *time.Time
@@ -291,6 +294,7 @@ type keeperAccountResult struct {
 	SecondaryResetAt       *time.Time
 	PrimaryWindowSeconds   *int
 	SecondaryWindowSeconds *int
+	QuotaObserved          bool
 	QuotaThreshold         *int
 	LastStatusCode         *int
 	LastError              *string
@@ -1330,7 +1334,7 @@ func keeperQuotaWindowForAccount(account keeperAccount, primary bool, now time.T
 	if resetAt == nil {
 		return nil
 	}
-	seconds, source, ok := keeperQuotaWindowSeconds(account.AccountType, windowSeconds, primary)
+	seconds, source, ok := keeperQuotaWindowSeconds(account.AccountType, windowSeconds, resetAt, primary, now)
 	if !ok {
 		return nil
 	}
@@ -1346,7 +1350,7 @@ func keeperQuotaWindowForAccount(account keeperAccount, primary bool, now time.T
 	}
 }
 
-func keeperQuotaWindowSeconds(accountType *string, saved *int, primary bool) (int, string, bool) {
+func keeperQuotaWindowSeconds(accountType *string, saved *int, resetAt *time.Time, primary bool, now time.Time) (int, string, bool) {
 	if saved != nil && *saved > 0 {
 		return *saved, "codex", true
 	}
@@ -1355,7 +1359,13 @@ func keeperQuotaWindowSeconds(accountType *string, saved *int, primary bool) (in
 	}
 	if keeperPaidQuotaWindowAccount(accountType) {
 		if primary {
+			if resetAt != nil && resetAt.In(appTimeLocation).After(now.Add(time.Duration(keeperFiveHourWindowSeconds)*time.Second+keeperWindowInferenceTolerance)) {
+				return keeperMonthWindowSeconds, "inferred", true
+			}
 			return keeperFiveHourWindowSeconds, "inferred", true
+		}
+		if resetAt != nil && resetAt.In(appTimeLocation).After(now.Add(time.Duration(keeperWeekWindowSeconds)*time.Second+keeperWindowInferenceTolerance)) {
+			return 0, "", false
 		}
 		return keeperWeekWindowSeconds, "inferred", true
 	}
@@ -1472,7 +1482,7 @@ func keeperSingleAuthNameForUsageIdentifier(identifier string, aliases map[strin
 }
 
 func keeperRecordInQuotaWindow(record UsageRecord, usage *keeperQuotaWindowUsage) bool {
-	if usage == nil {
+	if usage == nil || usage.Stale {
 		return false
 	}
 	return !record.Timestamp.Before(usage.WindowStart) && record.Timestamp.Before(usage.WindowEnd)
@@ -2532,13 +2542,16 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	}
 	usage := parseKeeperUsageInfo(usageResult.JSONData)
 	result.AccountType = accountTypeFromKeeperDetail(merged, &usage)
-	result.PrimaryUsedPercent = &usage.PrimaryUsedPercent
+	result.PrimaryUsedPercent = usage.PrimaryUsedPercent
 	result.SecondaryUsedPercent = usage.SecondaryUsedPercent
 	result.PrimaryResetAt = usage.PrimaryResetAt
 	result.SecondaryResetAt = usage.SecondaryResetAt
 	result.PrimaryWindowSeconds = usage.PrimaryWindowSeconds
 	result.SecondaryWindowSeconds = usage.SecondaryWindowSeconds
-	result.QuotaThreshold = &cfg.CodexKeeper.QuotaThreshold
+	result.QuotaObserved = usage.QuotaObserved
+	if usage.QuotaObserved {
+		result.QuotaThreshold = &cfg.CodexKeeper.QuotaThreshold
+	}
 	result.Result = "healthy"
 
 	if recoverableUnauthorizedDisabled {
@@ -2610,7 +2623,7 @@ type keeperPriorityPolicyAction struct {
 }
 
 func (a *App) applyKeeperPriorityPolicy(ctx context.Context, cfg AppConfig, name string, accountType *string, priority *int, restorePriority *int, usage keeperUsageInfo) *keeperPriorityPolicyAction {
-	quotaReached := usage.PrimaryUsedPercent >= cfg.CodexKeeper.QuotaThreshold ||
+	quotaReached := (usage.PrimaryUsedPercent != nil && *usage.PrimaryUsedPercent >= cfg.CodexKeeper.QuotaThreshold) ||
 		(usage.SecondaryUsedPercent != nil && *usage.SecondaryUsedPercent >= cfg.CodexKeeper.QuotaThreshold)
 	currentPriority := keeperEffectivePriority(priority)
 	next := keeperPriorityForType(accountType, cfg.CodexKeeperPriorityRule)
@@ -2931,7 +2944,7 @@ func parseKeeperAccountListQuery(values url.Values) keeperAccountListQuery {
 	pageSize = clampInt(pageSize, 1, keeperAccountsMaxPageSize, keeperAccountsDefaultPageSize)
 	sortKey := strings.TrimSpace(values.Get("sort_key"))
 	switch sortKey {
-	case "quotaDay", "quotaWeek", "accountType", "status", "priority", "lastCheckedAt":
+	case "quotaDay", "quotaWeek", "monthlyUsage", "totalUsage", "refreshAt", "accountType", "status", "priority", "lastCheckedAt":
 	default:
 		sortKey = ""
 	}
@@ -2974,6 +2987,16 @@ func (a *App) listKeeperAccountsPage(ctx context.Context, query keeperAccountLis
 		query.Page = 1
 	}
 	query.PageSize = clampInt(query.PageSize, 1, keeperAccountsMaxPageSize, keeperAccountsDefaultPageSize)
+	now := time.Now().In(appTimeLocation)
+	if keeperAccountListSortNeedsUsageStats(query.SortKey) {
+		allAccounts, err := a.listKeeperAccounts(ctx)
+		if err != nil {
+			return keeperAccountListResult{}, err
+		}
+		if err := a.ensureKeeperUsageStatsAvailable(ctx, allAccounts, now); err != nil {
+			return keeperAccountListResult{}, err
+		}
+	}
 	total, enabled, disabled, unauthorized, exhausted, err := a.keeperAccountCounts(ctx, "", nil)
 	if err != nil {
 		return keeperAccountListResult{}, err
@@ -2991,7 +3014,7 @@ func (a *App) listKeeperAccountsPage(ctx context.Context, query keeperAccountLis
 		query.Page = totalPages
 	}
 
-	accounts, err := a.queryKeeperAccountsPage(ctx, query, where, args)
+	accounts, err := a.queryKeeperAccountsPage(ctx, query, where, args, now)
 	if err != nil {
 		return keeperAccountListResult{}, err
 	}
@@ -3035,9 +3058,11 @@ func (a *App) keeperAccountCounts(ctx context.Context, where string, args []any)
 	return total, enabled, disabled, unauthorized, exhausted, err
 }
 
-func (a *App) queryKeeperAccountsPage(ctx context.Context, query keeperAccountListQuery, where string, args []any) ([]keeperAccount, error) {
-	limitArgs := append([]any{}, args...)
-	limitArgs = append(limitArgs, query.PageSize, (query.Page-1)*query.PageSize)
+func (a *App) queryKeeperAccountsPage(ctx context.Context, query keeperAccountListQuery, where string, args []any, now time.Time) ([]keeperAccount, error) {
+	queryArgs := append([]any{}, args...)
+	orderBy, orderArgs := keeperAccountListOrderBy(query, now)
+	queryArgs = append(queryArgs, orderArgs...)
+	queryArgs = append(queryArgs, query.PageSize, (query.Page-1)*query.PageSize)
 	sqlText := `
 		SELECT auth_name, email, account_type, disabled, priority, primary_used_percent,
 		       secondary_used_percent, CAST(primary_reset_at AS TEXT), CAST(secondary_reset_at AS TEXT), quota_threshold,
@@ -3048,8 +3073,8 @@ func (a *App) queryKeeperAccountsPage(ctx context.Context, query keeperAccountLi
 	if strings.TrimSpace(where) != "" {
 		sqlText += " " + where
 	}
-	sqlText += " " + keeperAccountListOrderBy(query) + " LIMIT ? OFFSET ?"
-	rows, err := a.db.QueryContext(ctx, sqlText, limitArgs...)
+	sqlText += " " + orderBy + " LIMIT ? OFFSET ?"
+	rows, err := a.db.QueryContext(ctx, sqlText, queryArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -3128,7 +3153,11 @@ func keeperAccountListWhere(query keeperAccountListQuery) (string, []any) {
 	return "WHERE " + strings.Join(clauses, " AND "), args
 }
 
-func keeperAccountListOrderBy(query keeperAccountListQuery) string {
+func keeperAccountListSortNeedsUsageStats(sortKey string) bool {
+	return sortKey == "monthlyUsage" || sortKey == "totalUsage"
+}
+
+func keeperAccountListOrderBy(query keeperAccountListQuery, now time.Time) (string, []any) {
 	direction := "ASC"
 	if query.SortDirection == "desc" {
 		direction = "DESC"
@@ -3142,24 +3171,49 @@ func keeperAccountListOrderBy(query keeperAccountListQuery) string {
 			WHEN disabled != 0 THEN NULL
 			WHEN LOWER(COALESCE(account_type, '')) = 'free' THEN NULL
 			ELSE 100 - primary_used_percent
-		END`)
+		END`), nil
 	case "quotaWeek":
 		return orderNullable(`CASE
 			WHEN disabled != 0 THEN NULL
 			WHEN LOWER(COALESCE(account_type, '')) = 'free' THEN 100 - primary_used_percent
 			WHEN LOWER(COALESCE(account_type, '')) IN ('plus', 'team') OR LOWER(COALESCE(account_type, '')) LIKE 'pro%' THEN 100 - secondary_used_percent
 			ELSE NULL
-		END`)
+		END`), nil
+	case "monthlyUsage":
+		monthStart := dbTime(keeperStatsStartOfMonth(now))
+		return orderNullable(`(
+			SELECT stats.records
+			FROM codex_keeper_account_usage_stats stats
+			WHERE stats.auth_name = codex_keeper_auth_states.auth_name
+				AND stats.period_type = 'month'
+				AND stats.period_start = ?
+			LIMIT 1
+		)`), []any{monthStart, monthStart}
+	case "totalUsage":
+		return orderNullable(`(
+			SELECT SUM(stats.records)
+			FROM codex_keeper_account_usage_stats stats
+			WHERE stats.auth_name = codex_keeper_auth_states.auth_name
+				AND stats.period_type = 'day'
+		)`), nil
+	case "refreshAt":
+		return orderNullable(`CASE
+			WHEN disabled != 0 THEN NULL
+			WHEN primary_reset_at IS NULL THEN secondary_reset_at
+			WHEN secondary_reset_at IS NULL THEN primary_reset_at
+			WHEN primary_reset_at <= secondary_reset_at THEN primary_reset_at
+			ELSE secondary_reset_at
+		END`), nil
 	case "accountType":
-		return orderNullable(`LOWER(account_type)`)
+		return orderNullable(`LOWER(account_type)`), nil
 	case "status":
-		return "ORDER BY disabled " + direction + ", COALESCE(email, '') COLLATE NOCASE, auth_name COLLATE NOCASE"
+		return "ORDER BY disabled " + direction + ", COALESCE(email, '') COLLATE NOCASE, auth_name COLLATE NOCASE", nil
 	case "priority":
-		return "ORDER BY COALESCE(priority, 0) " + direction + ", COALESCE(email, '') COLLATE NOCASE, auth_name COLLATE NOCASE"
+		return "ORDER BY COALESCE(priority, 0) " + direction + ", COALESCE(email, '') COLLATE NOCASE, auth_name COLLATE NOCASE", nil
 	case "lastCheckedAt":
-		return orderNullable(`last_checked_at`)
+		return orderNullable(`last_checked_at`), nil
 	default:
-		return "ORDER BY disabled DESC, COALESCE(email, '') COLLATE NOCASE, auth_name COLLATE NOCASE"
+		return "ORDER BY disabled DESC, COALESCE(email, '') COLLATE NOCASE, auth_name COLLATE NOCASE", nil
 	}
 }
 
@@ -3303,17 +3357,17 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			latest_action = excluded.latest_action,
 			last_error = excluded.last_error,
 			last_status_code = excluded.last_status_code,
-			primary_used_percent = excluded.primary_used_percent,
-			secondary_used_percent = excluded.secondary_used_percent,
-			quota_threshold = excluded.quota_threshold,
-			primary_reset_at = excluded.primary_reset_at,
-			secondary_reset_at = excluded.secondary_reset_at,
-			primary_window_seconds = excluded.primary_window_seconds,
-			secondary_window_seconds = excluded.secondary_window_seconds,
+			primary_used_percent = CASE WHEN ? THEN excluded.primary_used_percent ELSE codex_keeper_auth_states.primary_used_percent END,
+			secondary_used_percent = CASE WHEN ? THEN excluded.secondary_used_percent ELSE codex_keeper_auth_states.secondary_used_percent END,
+			quota_threshold = CASE WHEN ? THEN excluded.quota_threshold ELSE codex_keeper_auth_states.quota_threshold END,
+			primary_reset_at = CASE WHEN ? THEN excluded.primary_reset_at ELSE codex_keeper_auth_states.primary_reset_at END,
+			secondary_reset_at = CASE WHEN ? THEN excluded.secondary_reset_at ELSE codex_keeper_auth_states.secondary_reset_at END,
+			primary_window_seconds = CASE WHEN ? THEN excluded.primary_window_seconds ELSE codex_keeper_auth_states.primary_window_seconds END,
+			secondary_window_seconds = CASE WHEN ? THEN excluded.secondary_window_seconds ELSE codex_keeper_auth_states.secondary_window_seconds END,
 			last_checked_at = excluded.last_checked_at,
 			last_healthy_at = COALESCE(excluded.last_healthy_at, codex_keeper_auth_states.last_healthy_at),
 			updated_at = excluded.updated_at
-	`, result.Name, result.Email, result.AccountType, boolValue(result.Disabled), result.Priority, result.RestorePriority, result.LatestAction, result.LastError, result.LastStatusCode, result.PrimaryUsedPercent, result.SecondaryUsedPercent, result.QuotaThreshold, dbTimePtr(result.PrimaryResetAt), dbTimePtr(result.SecondaryResetAt), result.PrimaryWindowSeconds, result.SecondaryWindowSeconds, checkedAt, lastHealthy, now, now, result.ClearRestorePriority)
+	`, result.Name, result.Email, result.AccountType, boolValue(result.Disabled), result.Priority, result.RestorePriority, result.LatestAction, result.LastError, result.LastStatusCode, result.PrimaryUsedPercent, result.SecondaryUsedPercent, result.QuotaThreshold, dbTimePtr(result.PrimaryResetAt), dbTimePtr(result.SecondaryResetAt), result.PrimaryWindowSeconds, result.SecondaryWindowSeconds, checkedAt, lastHealthy, now, now, result.ClearRestorePriority, result.QuotaObserved, result.QuotaObserved, result.QuotaObserved, result.QuotaObserved, result.QuotaObserved, result.QuotaObserved, result.QuotaObserved)
 	return err
 }
 
@@ -3554,9 +3608,13 @@ func parseKeeperUsageInfo(payload map[string]any) keeperUsageInfo {
 	primary, _ := rateLimit["primary_window"].(map[string]any)
 	secondary, _ := rateLimit["secondary_window"].(map[string]any)
 	if value := keeperIntPtr(primary["used_percent"]); value != nil {
-		usage.PrimaryUsedPercent = *value
+		usage.PrimaryUsedPercent = value
+		usage.QuotaObserved = true
 	}
-	usage.SecondaryUsedPercent = keeperIntPtr(secondary["used_percent"])
+	if value := keeperIntPtr(secondary["used_percent"]); value != nil {
+		usage.SecondaryUsedPercent = value
+		usage.QuotaObserved = true
+	}
 	usage.PrimaryResetAt = quotaResetAt(primary, time.Now().In(appTimeLocation))
 	usage.SecondaryResetAt = quotaResetAt(secondary, time.Now().In(appTimeLocation))
 	usage.PrimaryWindowSeconds = quotaWindowSeconds(primary)
@@ -3602,6 +3660,7 @@ func quotaResetAt(window map[string]any, base time.Time) *time.Time {
 }
 
 func accountTypeFromKeeperDetail(detail map[string]any, usage *keeperUsageInfo) *string {
+	windowType := accountTypeFromKeeperQuotaWindows(usage, time.Now().In(appTimeLocation))
 	values := []string{}
 	if usage != nil {
 		values = append(values, usage.PlanType)
@@ -3623,9 +3682,56 @@ func accountTypeFromKeeperDetail(detail map[string]any, usage *keeperUsageInfo) 
 	case strings.Contains(text, "free"):
 		result = "free"
 	default:
-		return nil
+		return windowType
+	}
+	if windowType != nil {
+		if *windowType == "free" || result == "free" {
+			return windowType
+		}
 	}
 	return &result
+}
+
+func accountTypeFromKeeperQuotaWindows(usage *keeperUsageInfo, now time.Time) *string {
+	if usage == nil {
+		return nil
+	}
+	if keeperUsageLooksLikeFreeWindow(usage, now) {
+		result := "free"
+		return &result
+	}
+	if keeperUsageLooksLikePaidWindow(usage) {
+		result := "plus"
+		return &result
+	}
+	return nil
+}
+
+func keeperUsageLooksLikeFreeWindow(usage *keeperUsageInfo, now time.Time) bool {
+	if usage.PrimaryWindowSeconds != nil && keeperMonthlyWindowSeconds(*usage.PrimaryWindowSeconds) {
+		return usage.SecondaryWindowSeconds == nil || *usage.SecondaryWindowSeconds != keeperWeekWindowSeconds
+	}
+	if usage.SecondaryWindowSeconds != nil && keeperMonthlyWindowSeconds(*usage.SecondaryWindowSeconds) {
+		return true
+	}
+	if usage.PrimaryWindowSeconds == nil && usage.SecondaryWindowSeconds == nil && usage.SecondaryResetAt == nil && usage.PrimaryResetAt != nil {
+		return usage.PrimaryResetAt.In(appTimeLocation).After(now.Add(time.Duration(keeperFiveHourWindowSeconds)*time.Second + keeperWindowInferenceTolerance))
+	}
+	return false
+}
+
+func keeperMonthlyWindowSeconds(seconds int) bool {
+	return seconds >= keeperMinMonthWindowSeconds
+}
+
+func keeperUsageLooksLikePaidWindow(usage *keeperUsageInfo) bool {
+	if usage.PrimaryWindowSeconds != nil && *usage.PrimaryWindowSeconds == keeperFiveHourWindowSeconds {
+		return true
+	}
+	if usage.SecondaryWindowSeconds != nil && *usage.SecondaryWindowSeconds == keeperWeekWindowSeconds {
+		return true
+	}
+	return false
 }
 
 func keeperAccountTypeValues(detail map[string]any) []string {

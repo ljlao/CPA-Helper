@@ -429,6 +429,39 @@ func TestAccountTypeFromKeeperDetailNormalizesCodexProPlans(t *testing.T) {
 			want:   "plus",
 		},
 		{
+			name: "monthly quota window overrides stale plus plan",
+			usage: &keeperUsageInfo{
+				PlanType:             "plus",
+				PrimaryWindowSeconds: intPtrValue(keeperMonthWindowSeconds),
+			},
+			want: "free",
+		},
+		{
+			name:   "monthly quota window overrides stale plus detail",
+			detail: map[string]any{"account_type": "plus"},
+			usage: &keeperUsageInfo{
+				PrimaryWindowSeconds: intPtrValue(keeperMonthWindowSeconds),
+			},
+			want: "free",
+		},
+		{
+			name:   "calendar month quota window overrides stale plus detail",
+			detail: map[string]any{"account_type": "plus"},
+			usage: &keeperUsageInfo{
+				PrimaryWindowSeconds: intPtrValue(31 * 24 * 60 * 60),
+			},
+			want: "free",
+		},
+		{
+			name:   "paid quota window overrides stale free detail",
+			detail: map[string]any{"account_type": "free"},
+			usage: &keeperUsageInfo{
+				PrimaryWindowSeconds:   intPtrValue(keeperFiveHourWindowSeconds),
+				SecondaryWindowSeconds: intPtrValue(keeperWeekWindowSeconds),
+			},
+			want: "plus",
+		},
+		{
 			name:   "unknown stays nil",
 			detail: map[string]any{"name": "codex-user@example.com.json"},
 		},
@@ -494,6 +527,18 @@ func TestKeeperQuotaWindowUsageInfersAccountWindows(t *testing.T) {
 		t.Fatalf("plus secondary window = %#v, want inferred weekly", plusPair.Secondary)
 	}
 
+	expiredPlusPair := keeperQuotaWindowPairForAccount(keeperAccount{
+		Name:           "expired-plus.json",
+		AccountType:    stringPtr("plus"),
+		PrimaryResetAt: timePtrValue(now.Add(20 * 24 * time.Hour)),
+	}, now)
+	if expiredPlusPair.Primary == nil || expiredPlusPair.Primary.WindowSeconds != keeperMonthWindowSeconds {
+		t.Fatalf("expired plus primary window = %#v, want inferred monthly", expiredPlusPair.Primary)
+	}
+	if expiredPlusPair.Secondary != nil {
+		t.Fatal("expired plus secondary window is not nil, want single monthly window")
+	}
+
 	usage := parseKeeperUsageInfo(map[string]any{
 		"plan_type": "plus",
 		"rate_limit": map[string]any{
@@ -516,6 +561,69 @@ func TestKeeperQuotaWindowUsageInfersAccountWindows(t *testing.T) {
 	camelUsage := parseKeeperUsageInfo(map[string]any{"planType": "pro"})
 	if camelUsage.PlanType != "pro" {
 		t.Fatalf("camel planType = %q, want pro", camelUsage.PlanType)
+	}
+}
+
+func TestKeeperStateRefreshWithoutQuotaSnapshotPreservesStoredQuota(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+	now := time.Date(2026, 6, 11, 14, 30, 0, 0, appTimeLocation)
+	resetAt := now.Add(2 * time.Hour)
+	secondaryResetAt := now.Add(24 * time.Hour)
+	status := 200
+	quotaThreshold := 80
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name:                   "preserve-quota.json",
+		Result:                 "healthy",
+		AccountType:            stringPtr("plus"),
+		Disabled:               boolPtrValue(false),
+		PrimaryUsedPercent:     intPtrValue(67),
+		SecondaryUsedPercent:   intPtrValue(12),
+		PrimaryResetAt:         timePtrValue(resetAt),
+		SecondaryResetAt:       timePtrValue(secondaryResetAt),
+		PrimaryWindowSeconds:   intPtrValue(keeperFiveHourWindowSeconds),
+		SecondaryWindowSeconds: intPtrValue(keeperWeekWindowSeconds),
+		QuotaObserved:          true,
+		QuotaThreshold:         intPtrValue(quotaThreshold),
+		LastStatusCode:         &status,
+		CheckedAt:              now,
+	}); err != nil {
+		t.Fatalf("seed keeper state: %v", err)
+	}
+
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name:           "preserve-quota.json",
+		Result:         "healthy",
+		AccountType:    stringPtr("plus"),
+		Disabled:       boolPtrValue(false),
+		QuotaObserved:  false,
+		LastStatusCode: &status,
+		CheckedAt:      now.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("refresh keeper state without quota: %v", err)
+	}
+
+	state, err := app.getKeeperState(ctx, "preserve-quota.json")
+	if err != nil {
+		t.Fatalf("load keeper state: %v", err)
+	}
+	if intPtrValueOr(state.PrimaryUsedPercent, -1) != 67 || intPtrValueOr(state.SecondaryUsedPercent, -1) != 12 {
+		t.Fatalf("quota percents = %v/%v, want 67/12", state.PrimaryUsedPercent, state.SecondaryUsedPercent)
+	}
+	if state.PrimaryResetAt == nil || !state.PrimaryResetAt.Equal(resetAt) {
+		t.Fatalf("primary reset = %v, want %v", state.PrimaryResetAt, resetAt)
+	}
+	if state.SecondaryResetAt == nil || !state.SecondaryResetAt.Equal(secondaryResetAt) {
+		t.Fatalf("secondary reset = %v, want %v", state.SecondaryResetAt, secondaryResetAt)
+	}
+	if intPtrValueOr(state.PrimaryWindowSeconds, -1) != keeperFiveHourWindowSeconds || intPtrValueOr(state.SecondaryWindowSeconds, -1) != keeperWeekWindowSeconds {
+		t.Fatalf("window seconds = %v/%v, want 5h/week", state.PrimaryWindowSeconds, state.SecondaryWindowSeconds)
 	}
 }
 
@@ -603,6 +711,50 @@ func TestKeeperQuotaWindowUsageUsesCurrentWindowBoundariesAndPricing(t *testing.
 	}
 	if usage.UnpricedRecords != 0 {
 		t.Fatalf("unpriced records = %d, want 0", usage.UnpricedRecords)
+	}
+}
+
+func TestKeeperQuotaWindowUsageDoesNotCountStaleWindow(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	now := time.Date(2026, 5, 18, 12, 30, 0, 0, appTimeLocation)
+	resetAt := now.Add(-30 * time.Minute)
+	accounts := []keeperAccount{
+		{
+			Name:                 "stale-plus.json",
+			Email:                stringPtr("stale-plus@example.com"),
+			AccountType:          stringPtr("plus"),
+			PrimaryResetAt:       timePtrValue(resetAt),
+			PrimaryWindowSeconds: intPtrValue(keeperFiveHourWindowSeconds),
+		},
+	}
+	insertKeeperWindowUsageRecord(t, app, keeperWindowUsageSeed{
+		Dedupe:       "stale-window-record",
+		Timestamp:    resetAt.Add(-30 * time.Minute),
+		Source:       "stale-plus@example.com",
+		InputTokens:  100,
+		OutputTokens: 50,
+		RawJSON:      `{"source":"stale-plus@example.com"}`,
+	})
+
+	usages, err := app.computeKeeperQuotaWindowUsages(context.Background(), accounts, now)
+	if err != nil {
+		t.Fatalf("compute window usages: %v", err)
+	}
+	usage := usages["stale-plus.json"].Primary
+	if usage == nil {
+		t.Fatal("primary window usage is nil")
+	}
+	if !usage.Stale {
+		t.Fatal("primary window stale = false, want true")
+	}
+	if usage.Records != 0 || usage.TotalTokens != 0 {
+		t.Fatalf("stale usage = records %d tokens %d, want zero", usage.Records, usage.TotalTokens)
 	}
 }
 
@@ -1602,7 +1754,7 @@ func TestKeeperStatusStatsUseLatestDaemonRunOnly(t *testing.T) {
 	}
 }
 
-func TestKeeperUsageStatsAggregatesDailyAndWeeklyByAccount(t *testing.T) {
+func TestKeeperUsageStatsAggregatesDailyWeeklyAndMonthlyByAccount(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 
 	app, err := New()
@@ -1654,6 +1806,9 @@ func TestKeeperUsageStatsAggregatesDailyAndWeeklyByAccount(t *testing.T) {
 	if summary.Today.Records != 1 || summary.ThisWeek.Records != 1 || summary.LastWeek.Records != 1 || summary.TwoWeeksAgo.Records != 1 {
 		t.Fatalf("weekly summary records = today %d this %d last %d two %d, want all 1", summary.Today.Records, summary.ThisWeek.Records, summary.LastWeek.Records, summary.TwoWeeksAgo.Records)
 	}
+	if summary.ThisMonth.Records != 1 || summary.ActiveMonths != 2 {
+		t.Fatalf("monthly summary = this month %d active months %d, want 1 / 2", summary.ThisMonth.Records, summary.ActiveMonths)
+	}
 	if summary.AllTime.Records != 3 || summary.AllTime.TotalTokens != 81 {
 		t.Fatalf("all time = %d records / %d tokens, want 3 / 81", summary.AllTime.Records, summary.AllTime.TotalTokens)
 	}
@@ -1667,6 +1822,9 @@ func TestKeeperUsageStatsAggregatesDailyAndWeeklyByAccount(t *testing.T) {
 	}
 	if len(detail.Weekly) < 3 || detail.Weekly[0].Records != 1 {
 		t.Fatalf("weekly detail = %#v, want latest populated week first", detail.Weekly)
+	}
+	if len(detail.Monthly) < 2 || detail.Monthly[0].Label != "2026-06" || detail.Monthly[0].Records != 1 || detail.Monthly[1].Label != "2026-05" || detail.Monthly[1].Records != 2 {
+		t.Fatalf("monthly detail = %#v, want June then May totals", detail.Monthly)
 	}
 	if len(detail.Daily) < 3 || detail.Daily[0].Records != 1 {
 		t.Fatalf("daily detail = %#v, want latest populated day first", detail.Daily)
@@ -1725,6 +1883,62 @@ func TestKeeperAccountListPageFiltersAndPaginates(t *testing.T) {
 		t.Fatalf("page account = %q, want beta.json", result.Accounts[0].Name)
 	}
 	assertStringSet(t, result.AccountTypes, []string{"free", "plus"})
+}
+
+func TestKeeperAccountListPageSortsByUsageAndRefreshTime(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+	now := time.Now().In(appTimeLocation)
+	insertKeeperStateForCandidateWithEmail(t, app, "alpha.json", stringPtr("alpha@example.com"), timePtrValue(now.Add(3*time.Hour)), nil)
+	insertKeeperStateForCandidateWithEmail(t, app, "beta.json", stringPtr("beta@example.com"), timePtrValue(now.Add(1*time.Hour)), nil)
+	insertKeeperStateForCandidateWithEmail(t, app, "gamma.json", stringPtr("gamma@example.com"), timePtrValue(now.Add(2*time.Hour)), nil)
+
+	thisMonth := keeperStatsStartOfMonth(now)
+	today := keeperStatsStartOfDay(now)
+	insertKeeperAccountUsageStatsPeriod(t, app, "alpha.json", "month", thisMonth, 5)
+	insertKeeperAccountUsageStatsPeriod(t, app, "beta.json", "month", thisMonth, 11)
+	insertKeeperAccountUsageStatsPeriod(t, app, "gamma.json", "month", thisMonth, 7)
+	insertKeeperAccountUsageStatsPeriod(t, app, "alpha.json", "day", today, 20)
+	insertKeeperAccountUsageStatsPeriod(t, app, "beta.json", "day", today, 11)
+	insertKeeperAccountUsageStatsPeriod(t, app, "gamma.json", "day", today, 30)
+
+	assertKeeperAccountPageOrder := func(query keeperAccountListQuery, want []string) {
+		t.Helper()
+		query.Page = 1
+		query.PageSize = 3
+		result, err := app.listKeeperAccountsPage(ctx, query)
+		if err != nil {
+			t.Fatalf("list keeper accounts page sort %s: %v", query.SortKey, err)
+		}
+		if len(result.Accounts) != len(want) {
+			t.Fatalf("sorted accounts = %#v, want %v", result.Accounts, want)
+		}
+		for i, account := range result.Accounts {
+			if account.Name != want[i] {
+				t.Fatalf("sorted accounts[%d] = %q, want %q in %v", i, account.Name, want[i], want)
+			}
+		}
+	}
+
+	assertKeeperAccountPageOrder(
+		keeperAccountListQuery{SortKey: "monthlyUsage", SortDirection: "desc"},
+		[]string{"beta.json", "gamma.json", "alpha.json"},
+	)
+	assertKeeperAccountPageOrder(
+		keeperAccountListQuery{SortKey: "totalUsage", SortDirection: "desc"},
+		[]string{"gamma.json", "alpha.json", "beta.json"},
+	)
+	assertKeeperAccountPageOrder(
+		keeperAccountListQuery{SortKey: "refreshAt", SortDirection: "asc"},
+		[]string{"beta.json", "gamma.json", "alpha.json"},
+	)
 }
 
 func configureKeeperTestCPA(t *testing.T, app *App, url string, mutate func(*AppConfig)) {
@@ -1821,6 +2035,33 @@ func insertKeeperWindowUsageRecord(t *testing.T, app *App, seed keeperWindowUsag
 	}
 	if _, err := app.db.Exec(`INSERT INTO usage_record_payloads (usage_record_id, raw_json, created_at) VALUES (?, ?, ?)`, id, rawJSON, now); err != nil {
 		t.Fatalf("insert quota usage payload %s: %v", seed.Dedupe, err)
+	}
+}
+
+func insertKeeperAccountUsageStatsPeriod(t *testing.T, app *App, authName string, periodType string, periodStart time.Time, records int) {
+	t.Helper()
+	periodEnd := periodStart.AddDate(0, 0, 1)
+	switch periodType {
+	case "week":
+		periodEnd = periodStart.AddDate(0, 0, 7)
+	case "month":
+		periodEnd = periodStart.AddDate(0, 1, 0)
+	}
+	now := dbTime(time.Now().In(appTimeLocation))
+	_, err := app.db.Exec(`
+		INSERT INTO codex_keeper_account_usage_stats (
+			auth_name, period_type, period_start, period_end,
+			records, success_records, total_tokens, generated_at, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(auth_name, period_type, period_start) DO UPDATE SET
+			records = excluded.records,
+			success_records = excluded.success_records,
+			total_tokens = excluded.total_tokens,
+			generated_at = excluded.generated_at,
+			updated_at = excluded.updated_at
+	`, authName, periodType, dbTime(periodStart), dbTime(periodEnd), records, records, records, now, now, now)
+	if err != nil {
+		t.Fatalf("insert keeper usage stats %s %s: %v", authName, periodType, err)
 	}
 }
 
@@ -2159,6 +2400,17 @@ func timePtrValue(value time.Time) *time.Time {
 
 func intPtrValue(value int) *int {
 	return &value
+}
+
+func boolPtrValue(value bool) *bool {
+	return &value
+}
+
+func intPtrValueOr(value *int, fallback int) int {
+	if value == nil {
+		return fallback
+	}
+	return *value
 }
 
 func countKeeperRows(t *testing.T, app *App, query string) int {

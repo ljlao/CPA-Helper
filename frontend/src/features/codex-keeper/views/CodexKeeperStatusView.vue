@@ -73,7 +73,16 @@ type PriorityFilter = FixedPriorityFilter | PriorityTypeFilter
 type AccountStatusFilter = 'all' | 'enabled' | 'disabled' | 'unauthorized' | 'quotaExhausted'
 type AccountDisplaySize = 50 | 100 | 150 | 200
 type AccountListViewMode = 'table' | 'bar' | 'ring'
-type AccountSortKey = 'quotaDay' | 'quotaWeek' | 'accountType' | 'status' | 'priority' | 'lastCheckedAt'
+type AccountSortKey =
+  | 'quotaDay'
+  | 'quotaWeek'
+  | 'monthlyUsage'
+  | 'totalUsage'
+  | 'refreshAt'
+  | 'accountType'
+  | 'status'
+  | 'priority'
+  | 'lastCheckedAt'
 type SortDirection = 'asc' | 'desc'
 type PriorityMode = 'low' | 'high' | 'default'
 type AccountAction = 'toggle' | 'priority' | 'delete' | 'refresh'
@@ -85,10 +94,21 @@ type QuotaWindowItem = {
   usage: CodexKeeperQuotaWindowUsage | null
 }
 type QuotaUsageTag = { label: string; value: string; tone?: 'stale' }
+type AccountCallUsageItem = {
+  key: string
+  label: string
+  value: string
+  title: string
+}
+type AccountCallUsageSource = Pick<
+  CodexKeeperQuotaWindowUsage,
+  'records' | 'failed_records' | 'total_tokens' | 'estimated_cost_usd' | 'unpriced_records'
+>
 type UsageStatsDisplayItem = {
   label: string
   value: string
   title: string
+  detail?: string
 }
 type AccountStatusPreferences = {
   displaySize?: unknown
@@ -105,7 +125,7 @@ const ACCOUNT_TABLE_MAX_HEIGHT = 'min(620px, max(320px, calc(100dvh - 430px)))'
 const ACCOUNT_TABLE_VIRTUAL_THRESHOLD = 200
 const CODEX_FIVE_HOUR_WINDOW_SECONDS = 5 * 60 * 60
 const CODEX_WEEK_WINDOW_SECONDS = 7 * 24 * 60 * 60
-const CODEX_MONTH_WINDOW_SECONDS = 30 * 24 * 60 * 60
+const CODEX_MIN_MONTH_WINDOW_SECONDS = 28 * 24 * 60 * 60
 const disabledTableScrollX = 1662
 const normalTableScrollX = 2176
 const KEEPER_STATUS_POLL_INTERVAL_MS = 3000
@@ -371,6 +391,9 @@ const detailUsageSummaryItems = computed<UsageStatsDisplayItem[]>(() =>
 const detailWeeklyRows = computed<CodexKeeperUsageStatsPeriod[]>(
   () => selectedAccountUsageStats.value?.weekly ?? [],
 )
+const detailMonthlyRows = computed<CodexKeeperUsageStatsPeriod[]>(
+  () => selectedAccountUsageStats.value?.monthly ?? [],
+)
 const detailDailyRows = computed<CodexKeeperUsageStatsPeriod[]>(
   () => selectedAccountUsageStats.value?.daily ?? [],
 )
@@ -431,6 +454,9 @@ function isAccountSortKey(value: unknown): value is AccountSortKey {
   return (
     value === 'quotaDay' ||
     value === 'quotaWeek' ||
+    value === 'monthlyUsage' ||
+    value === 'totalUsage' ||
+    value === 'refreshAt' ||
     value === 'accountType' ||
     value === 'status' ||
     value === 'priority' ||
@@ -615,7 +641,7 @@ function handleAccountListViewSelect(key: string | number) {
 }
 
 function defaultSortDirection(key: AccountSortKey): SortDirection {
-  return key === 'priority' || key === 'lastCheckedAt' ? 'desc' : 'asc'
+  return key === 'priority' || key === 'lastCheckedAt' || key === 'monthlyUsage' || key === 'totalUsage' ? 'desc' : 'asc'
 }
 
 function handleQuotaSortSelect(key: string | number) {
@@ -676,20 +702,47 @@ function quotaWindowSecondsFor(account: CodexKeeperAccount, window: 'primary' | 
   return account.secondary_window_seconds ?? account.secondary_window_usage?.window_seconds ?? null
 }
 
-function isPaidQuotaWindow(account: CodexKeeperAccount): boolean {
+function hasObservedQuotaWindow(account: CodexKeeperAccount): boolean {
+  return quotaWindowSecondsFor(account, 'primary') !== null || quotaWindowSecondsFor(account, 'secondary') !== null
+}
+
+function hasPaidQuotaWindowShape(account: CodexKeeperAccount): boolean {
+  const primarySeconds = quotaWindowSecondsFor(account, 'primary')
+  const secondarySeconds = quotaWindowSecondsFor(account, 'secondary')
   return (
-    isPaidQuotaWindowAccount(account.account_type) ||
-    (quotaWindowSecondsFor(account, 'primary') === CODEX_FIVE_HOUR_WINDOW_SECONDS &&
-      quotaWindowSecondsFor(account, 'secondary') === CODEX_WEEK_WINDOW_SECONDS)
+    primarySeconds === CODEX_FIVE_HOUR_WINDOW_SECONDS &&
+    (secondarySeconds === CODEX_WEEK_WINDOW_SECONDS || (secondarySeconds === null && isPaidQuotaWindowAccount(account.account_type)))
   )
 }
 
+function isMonthlyQuotaWindowSeconds(seconds: number | null): boolean {
+  return seconds !== null && seconds >= CODEX_MIN_MONTH_WINDOW_SECONDS
+}
+
+function hasFreeQuotaWindowShape(account: CodexKeeperAccount): boolean {
+  const primarySeconds = quotaWindowSecondsFor(account, 'primary')
+  const secondarySeconds = quotaWindowSecondsFor(account, 'secondary')
+  return isMonthlyQuotaWindowSeconds(primarySeconds) && secondarySeconds !== CODEX_WEEK_WINDOW_SECONDS
+}
+
+function isPaidQuotaWindow(account: CodexKeeperAccount): boolean {
+  if (hasPaidQuotaWindowShape(account)) {
+    return true
+  }
+  if (hasObservedQuotaWindow(account)) {
+    return false
+  }
+  return isPaidQuotaWindowAccount(account.account_type)
+}
+
 function isFreeQuotaWindow(account: CodexKeeperAccount): boolean {
-  return (
-    isFreeQuotaWindowAccount(account.account_type) ||
-    (quotaWindowSecondsFor(account, 'primary') === CODEX_MONTH_WINDOW_SECONDS &&
-      quotaWindowSecondsFor(account, 'secondary') === null)
-  )
+  if (hasFreeQuotaWindowShape(account)) {
+    return true
+  }
+  if (hasObservedQuotaWindow(account)) {
+    return false
+  }
+  return isFreeQuotaWindowAccount(account.account_type)
 }
 
 function quotaWindowLabels(account: CodexKeeperAccount): { primary: string; secondary: string } {
@@ -849,6 +902,48 @@ function usageStatsRequestValue(metric: CodexKeeperUsageStatsMetric | null | und
   return `${formatInteger(usageStatsMetric(metric).records)}次`
 }
 
+function usageStatsTokenCostDetail(metric: CodexKeeperUsageStatsMetric | null | undefined): string {
+  const stats = usageStatsMetric(metric)
+  return `${formatCompact(stats.total_tokens)} / ${formatUsd(stats.estimated_cost_usd)}`
+}
+
+function accountCallUsageSourceTitle(label: string, source: AccountCallUsageSource | null | undefined): string {
+  const stats = source ?? EMPTY_USAGE_STATS_METRIC
+  const failed = stats.failed_records > 0 ? `，失败 ${formatInteger(stats.failed_records)} 次` : ''
+  const unpriced = stats.unpriced_records > 0 ? `，未计价 ${formatInteger(stats.unpriced_records)} 条` : ''
+  return `${label}：${formatInteger(stats.records)} 次请求${failed}，${formatCompact(stats.total_tokens)} Tokens，${formatUsd(stats.estimated_cost_usd)}${unpriced}`
+}
+
+function accountCallUsageItemsForPeriod(key: string, label: string, source: AccountCallUsageSource | null | undefined): AccountCallUsageItem[] {
+  const stats = source ?? EMPTY_USAGE_STATS_METRIC
+  const title = accountCallUsageSourceTitle(label, source)
+  return [
+    { key: `${key}-requests`, label, value: formatInteger(stats.records), title },
+    { key: `${key}-tokens`, label: 'Tokens', value: formatCompact(stats.total_tokens), title },
+    { key: `${key}-cost`, label: t('费用', 'Cost'), value: formatUsd(stats.estimated_cost_usd), title },
+  ]
+}
+
+function accountCardCallUsageItems(account: CodexKeeperAccount): AccountCallUsageItem[] {
+  const stats = account.usage_stats
+  const items: AccountCallUsageItem[] = []
+  if (isPaidQuotaWindow(account)) {
+    items.push(...accountCallUsageItemsForPeriod('five-hour', '5H', account.primary_window_usage))
+    items.push(...accountCallUsageItemsForPeriod('weekly', t('周', 'Week'), account.secondary_window_usage))
+    items.push(...accountCallUsageItemsForPeriod('monthly', t('月', 'Month'), stats?.this_month))
+    items.push(...accountCallUsageItemsForPeriod('total', t('总计', 'Total'), stats?.all_time))
+    return items
+  }
+  if (isFreeQuotaWindow(account)) {
+    items.push(...accountCallUsageItemsForPeriod('monthly', t('月', 'Month'), account.primary_window_usage ?? stats?.this_month))
+    items.push(...accountCallUsageItemsForPeriod('total', t('总计', 'Total'), stats?.all_time))
+    return items
+  }
+  items.push(...accountCallUsageItemsForPeriod('monthly', t('月', 'Month'), stats?.this_month))
+  items.push(...accountCallUsageItemsForPeriod('total', t('总计', 'Total'), stats?.all_time))
+  return items
+}
+
 function usageStatsMetricTitle(label: string, metric: CodexKeeperUsageStatsMetric | null | undefined): string {
   const stats = usageStatsMetric(metric)
   const failed = stats.failed_records > 0 ? `，失败 ${formatInteger(stats.failed_records)} 次` : ''
@@ -892,7 +987,14 @@ function usageStatsSummaryItems(stats: CodexKeeperAccountUsageStats['summary']):
     {
       label: '活跃',
       value: `${formatInteger(stats.active_weeks)}周`,
-      title: `有请求的周 ${formatInteger(stats.active_weeks)} 个，有请求的天 ${formatInteger(stats.active_days)} 天`,
+      title: `有请求的月 ${formatInteger(stats.active_months)} 个，周 ${formatInteger(stats.active_weeks)} 个，天 ${formatInteger(stats.active_days)} 天`,
+      detail: `${formatInteger(stats.active_months)}月 / ${formatInteger(stats.active_days)}天`,
+    },
+    {
+      label: '本月',
+      value: usageStatsRequestValue(stats.this_month),
+      title: usageStatsMetricTitle('本月', stats.this_month),
+      detail: usageStatsTokenCostDetail(stats.this_month),
     },
     {
       label: '本周',
@@ -910,9 +1012,10 @@ function usageStatsSummaryItems(stats: CodexKeeperAccountUsageStats['summary']):
       title: usageStatsMetricTitle('上上周', stats.two_weeks_ago),
     },
     {
-      label: '累计',
+      label: '总计',
       value: usageStatsRequestValue(stats.all_time),
-      title: usageStatsMetricTitle('累计', stats.all_time),
+      title: usageStatsMetricTitle('总计', stats.all_time),
+      detail: usageStatsTokenCostDetail(stats.all_time),
     },
   ]
 }
@@ -958,6 +1061,7 @@ function renderAccountUsageStatsCell(account: CodexKeeperAccount) {
         h('span', { class: 'account-usage-stat-chip', title: item.title }, [
           h('span', { class: 'account-usage-stat-label' }, item.label),
           h('strong', { class: 'account-usage-stat-value' }, item.value),
+          item.detail ? h('small', { class: 'account-usage-stat-detail' }, item.detail) : null,
         ]),
       ),
   )
@@ -2105,6 +2209,30 @@ onBeforeUnmount(() => {
             <NButton
               secondary
               size="small"
+              :type="isAccountSortActive('monthlyUsage') ? 'primary' : 'default'"
+              @click="toggleAccountSort('monthlyUsage')"
+            >
+              {{ t('月用量', 'Monthly Usage') }} {{ accountSortMark('monthlyUsage') }}
+            </NButton>
+            <NButton
+              secondary
+              size="small"
+              :type="isAccountSortActive('totalUsage') ? 'primary' : 'default'"
+              @click="toggleAccountSort('totalUsage')"
+            >
+              {{ t('总用量', 'Total Usage') }} {{ accountSortMark('totalUsage') }}
+            </NButton>
+            <NButton
+              secondary
+              size="small"
+              :type="isAccountSortActive('refreshAt') ? 'primary' : 'default'"
+              @click="toggleAccountSort('refreshAt')"
+            >
+              {{ t('刷新时间', 'Refresh Time') }} {{ accountSortMark('refreshAt') }}
+            </NButton>
+            <NButton
+              secondary
+              size="small"
               :type="isAccountSortActive('accountType') ? 'primary' : 'default'"
               @click="toggleAccountSort('accountType')"
             >
@@ -2312,6 +2440,7 @@ onBeforeUnmount(() => {
                 >
                   <span>{{ item.label }}</span>
                   <strong>{{ item.value }}</strong>
+                  <small v-if="item.detail">{{ item.detail }}</small>
                 </span>
               </div>
               <div class="account-card-meta-grid">
@@ -2360,17 +2489,6 @@ onBeforeUnmount(() => {
                       <span class="card-quota-reset">
                         {{ quotaWindowResetText(item) }}
                       </span>
-                      <div class="card-quota-usage-tags" :title="quotaWindowUsageTitle(item)">
-                        <span
-                          v-for="tag in quotaWindowUsageTags(item)"
-                          :key="`${item.label}-${tag.label}`"
-                          class="card-quota-usage-tag"
-                          :class="tag.tone ? `is-${tag.tone}` : undefined"
-                        >
-                          <span>{{ tag.label }}</span>
-                          <strong>{{ tag.value }}</strong>
-                        </span>
-                      </div>
                     </div>
                   </template>
                   <div v-else class="card-quota-rings">
@@ -2392,18 +2510,18 @@ onBeforeUnmount(() => {
                           <span>{{ quotaWindowResetText(item) }}</span>
                         </div>
                       </div>
-                      <div class="card-quota-usage-tags" :title="quotaWindowUsageTitle(item)">
-                        <span
-                          v-for="tag in quotaWindowUsageTags(item)"
-                          :key="`${item.label}-${tag.label}`"
-                          class="card-quota-usage-tag"
-                          :class="tag.tone ? `is-${tag.tone}` : undefined"
-                        >
-                          <span>{{ tag.label }}</span>
-                          <strong>{{ tag.value }}</strong>
-                        </span>
-                      </div>
                     </div>
+                  </div>
+                  <div class="card-call-usage-grid">
+                    <span
+                      v-for="usage in accountCardCallUsageItems(account)"
+                      :key="usage.key"
+                      class="card-call-usage-card"
+                      :title="usage.title"
+                    >
+                      <span>{{ usage.label }}</span>
+                      <strong>{{ usage.value }}</strong>
+                    </span>
                   </div>
                 </template>
                 <div v-else class="card-quota-empty">{{ t('暂无额度窗口', 'No quota windows') }}</div>
@@ -2554,7 +2672,23 @@ onBeforeUnmount(() => {
               >
                 <span>{{ item.label }}</span>
                 <strong>{{ item.value }}</strong>
+                <small v-if="item.detail">{{ item.detail }}</small>
               </div>
+            </div>
+            <div class="detail-table-block">
+              <div class="detail-section-head">
+                <h3>每月详情</h3>
+                <span>{{ detailMonthlyRows.length }} 月</span>
+              </div>
+              <NDataTable
+                class="detail-usage-table"
+                size="small"
+                :columns="usageStatsPeriodColumns"
+                :data="detailMonthlyRows"
+                :pagination="{ pageSize: 8 }"
+                table-layout="fixed"
+                :scroll-x="678"
+              />
             </div>
             <div class="detail-table-block">
               <div class="detail-section-head">
@@ -3170,7 +3304,8 @@ onBeforeUnmount(() => {
 }
 
 .account-card-usage-stat span,
-.account-card-usage-stat strong {
+.account-card-usage-stat strong,
+.account-card-usage-stat small {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3187,6 +3322,14 @@ onBeforeUnmount(() => {
   color: var(--cpa-text-strong);
   font-size: 12px;
   font-weight: 800;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+.account-card-usage-stat small {
+  color: color-mix(in srgb, var(--cpa-text-muted) 86%, var(--account-card-accent));
+  font-size: 10px;
+  font-weight: 700;
   line-height: 1.1;
   font-variant-numeric: tabular-nums;
 }
@@ -3396,6 +3539,57 @@ onBeforeUnmount(() => {
   color: var(--cpa-warning);
 }
 
+.card-call-usage-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+}
+
+.card-call-usage-card {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 7px 8px;
+  background: color-mix(in srgb, var(--account-card-accent) 7%, var(--account-card-inner-bg));
+  border: 1px solid color-mix(in srgb, var(--account-card-accent) 15%, var(--account-card-inner-border));
+  border-radius: var(--cpa-radius-sm);
+}
+
+.card-call-usage-card:nth-child(2),
+.card-call-usage-card:nth-child(5) {
+  background: color-mix(in srgb, var(--account-card-accent) 9%, var(--account-card-inner-bg));
+  border-color: color-mix(in srgb, var(--account-card-accent) 17%, var(--account-card-inner-border));
+}
+
+.card-call-usage-card:nth-child(3),
+.card-call-usage-card:nth-child(6) {
+  background: color-mix(in srgb, var(--account-card-accent) 11%, var(--account-card-inner-bg));
+  border-color: color-mix(in srgb, var(--account-card-accent) 19%, var(--account-card-inner-border));
+}
+
+.card-call-usage-card span,
+.card-call-usage-card strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card-call-usage-card span {
+  color: var(--cpa-text-muted);
+  font-size: 11px;
+  line-height: 1.1;
+}
+
+.card-call-usage-card strong {
+  color: var(--cpa-text-strong);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
 .card-quota-track {
   height: 8px;
   overflow: hidden;
@@ -3601,7 +3795,8 @@ onBeforeUnmount(() => {
 }
 
 .detail-stat-card span,
-.detail-stat-card strong {
+.detail-stat-card strong,
+.detail-stat-card small {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3617,6 +3812,13 @@ onBeforeUnmount(() => {
   color: var(--cpa-text-strong);
   font-size: 14px;
   font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
+.detail-stat-card small {
+  color: var(--cpa-text-muted);
+  font-size: 11px;
+  font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
 
@@ -3969,7 +4171,8 @@ onBeforeUnmount(() => {
 }
 
 :global(.account-usage-stat-label),
-:global(.account-usage-stat-value) {
+:global(.account-usage-stat-value),
+:global(.account-usage-stat-detail) {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3986,6 +4189,14 @@ onBeforeUnmount(() => {
   color: var(--cpa-text-strong);
   font-size: 12px;
   font-weight: 800;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+:global(.account-usage-stat-detail) {
+  color: var(--cpa-text-muted);
+  font-size: 10px;
+  font-weight: 700;
   line-height: 1.1;
   font-variant-numeric: tabular-nums;
 }

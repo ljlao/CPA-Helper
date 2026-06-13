@@ -72,11 +72,13 @@ type keeperUsageStatsSummaryResponse struct {
 	AliveWeeks      int                            `json:"alive_weeks"`
 	ActiveDays      int                            `json:"active_days"`
 	ActiveWeeks     int                            `json:"active_weeks"`
+	ActiveMonths    int                            `json:"active_months"`
 	FirstRequestAt  *string                        `json:"first_request_at"`
 	LastRequestAt   *string                        `json:"last_request_at"`
 	LastGeneratedAt *string                        `json:"last_generated_at"`
 	Today           keeperUsageStatsMetricResponse `json:"today"`
 	Yesterday       keeperUsageStatsMetricResponse `json:"yesterday"`
+	ThisMonth       keeperUsageStatsMetricResponse `json:"this_month"`
 	ThisWeek        keeperUsageStatsMetricResponse `json:"this_week"`
 	LastWeek        keeperUsageStatsMetricResponse `json:"last_week"`
 	TwoWeeksAgo     keeperUsageStatsMetricResponse `json:"two_weeks_ago"`
@@ -112,6 +114,7 @@ type keeperAccountUsageStatsResponse struct {
 	Summary     keeperUsageStatsSummaryResponse  `json:"summary"`
 	Daily       []keeperUsageStatsPeriodResponse `json:"daily"`
 	Weekly      []keeperUsageStatsPeriodResponse `json:"weekly"`
+	Monthly     []keeperUsageStatsPeriodResponse `json:"monthly"`
 }
 
 func NewKeeperUsageStatsRunner(app *App) *KeeperUsageStatsRunner {
@@ -242,15 +245,19 @@ func (a *App) refreshKeeperAccountUsageStats(ctx context.Context, now time.Time)
 		}
 		day := keeperStatsStartOfDay(record.Timestamp)
 		week := keeperStatsStartOfWeek(record.Timestamp)
+		month := keeperStatsStartOfMonth(record.Timestamp)
 		addKeeperUsageStatsRecord(keeperUsageStatsPeriodFor(periods, account, "day", day, day.AddDate(0, 0, 1), now), record, prices)
 		addKeeperUsageStatsRecord(keeperUsageStatsPeriodFor(periods, account, "week", week, week.AddDate(0, 0, 7), now), record, prices)
+		addKeeperUsageStatsRecord(keeperUsageStatsPeriodFor(periods, account, "month", month, month.AddDate(0, 1, 0), now), record, prices)
 	}
 
 	today := keeperStatsStartOfDay(now)
 	thisWeek := keeperStatsStartOfWeek(now)
+	thisMonth := keeperStatsStartOfMonth(now)
 	for _, account := range accounts {
 		keeperUsageStatsPeriodFor(periods, account, "day", today, today.AddDate(0, 0, 1), now)
 		keeperUsageStatsPeriodFor(periods, account, "week", thisWeek, thisWeek.AddDate(0, 0, 7), now)
+		keeperUsageStatsPeriodFor(periods, account, "month", thisMonth, thisMonth.AddDate(0, 1, 0), now)
 	}
 
 	return a.replaceKeeperUsageStats(ctx, periods)
@@ -450,15 +457,22 @@ func (a *App) keeperAccountUsageStats(ctx context.Context, authName string, now 
 		Summary:     summaries[authName],
 		Daily:       []keeperUsageStatsPeriodResponse{},
 		Weekly:      []keeperUsageStatsPeriodResponse{},
+		Monthly:     []keeperUsageStatsPeriodResponse{},
 	}
 	for _, period := range periods {
 		item := keeperUsageStatsPeriodResponseFrom(period)
-		if period.PeriodType == "week" {
+		switch period.PeriodType {
+		case "week":
 			response.Weekly = append(response.Weekly, item)
-		} else {
+		case "month":
+			response.Monthly = append(response.Monthly, item)
+		default:
 			response.Daily = append(response.Daily, item)
 		}
 	}
+	sort.Slice(response.Monthly, func(i, j int) bool {
+		return response.Monthly[i].PeriodStart > response.Monthly[j].PeriodStart
+	})
 	sort.Slice(response.Weekly, func(i, j int) bool {
 		return response.Weekly[i].PeriodStart > response.Weekly[j].PeriodStart
 	})
@@ -618,17 +632,20 @@ func keeperUsageStatsSummariesFromPeriods(accounts []keeperAccount, createdAt ma
 	thisWeek := keeperStatsStartOfWeek(now)
 	lastWeek := thisWeek.AddDate(0, 0, -7)
 	twoWeeksAgo := thisWeek.AddDate(0, 0, -14)
+	thisMonth := keeperStatsStartOfMonth(now)
 
 	type accountPeriodMetrics struct {
 		days        map[string]keeperUsageStatsMetric
 		weeks       map[string]keeperUsageStatsMetric
+		months      map[string]keeperUsageStatsMetric
 		generatedAt *time.Time
 	}
 	grouped := map[string]*accountPeriodMetrics{}
 	for _, account := range accounts {
 		grouped[account.Name] = &accountPeriodMetrics{
-			days:  map[string]keeperUsageStatsMetric{},
-			weeks: map[string]keeperUsageStatsMetric{},
+			days:   map[string]keeperUsageStatsMetric{},
+			weeks:  map[string]keeperUsageStatsMetric{},
+			months: map[string]keeperUsageStatsMetric{},
 		}
 	}
 	for _, period := range periods {
@@ -638,15 +655,19 @@ func keeperUsageStatsSummariesFromPeriods(accounts []keeperAccount, createdAt ma
 		bucket := grouped[period.AuthName]
 		if bucket == nil {
 			bucket = &accountPeriodMetrics{
-				days:  map[string]keeperUsageStatsMetric{},
-				weeks: map[string]keeperUsageStatsMetric{},
+				days:   map[string]keeperUsageStatsMetric{},
+				weeks:  map[string]keeperUsageStatsMetric{},
+				months: map[string]keeperUsageStatsMetric{},
 			}
 			grouped[period.AuthName] = bucket
 		}
 		key := keeperStatsPeriodKey(period.PeriodStart)
-		if period.PeriodType == "week" {
+		switch period.PeriodType {
+		case "week":
 			bucket.weeks[key] = period.Metric
-		} else {
+		case "month":
+			bucket.months[key] = period.Metric
+		default:
 			bucket.days[key] = period.Metric
 		}
 		if bucket.generatedAt == nil || period.GeneratedAt.After(*bucket.generatedAt) {
@@ -660,8 +681,9 @@ func keeperUsageStatsSummariesFromPeriods(accounts []keeperAccount, createdAt ma
 		bucket := grouped[account.Name]
 		if bucket == nil {
 			bucket = &accountPeriodMetrics{
-				days:  map[string]keeperUsageStatsMetric{},
-				weeks: map[string]keeperUsageStatsMetric{},
+				days:   map[string]keeperUsageStatsMetric{},
+				weeks:  map[string]keeperUsageStatsMetric{},
+				months: map[string]keeperUsageStatsMetric{},
 			}
 		}
 		allTime := keeperUsageStatsMetric{}
@@ -678,6 +700,12 @@ func keeperUsageStatsSummariesFromPeriods(accounts []keeperAccount, createdAt ma
 				activeWeeks++
 			}
 		}
+		activeMonths := 0
+		for _, metric := range bucket.months {
+			if metric.Records > 0 {
+				activeMonths++
+			}
+		}
 		startAt := createdAt[account.Name]
 		if startAt.IsZero() && allTime.FirstRequestAt != nil {
 			startAt = *allTime.FirstRequestAt
@@ -688,11 +716,13 @@ func keeperUsageStatsSummariesFromPeriods(accounts []keeperAccount, createdAt ma
 			AliveWeeks:      keeperUsageStatsAliveWeeks(aliveDays),
 			ActiveDays:      activeDays,
 			ActiveWeeks:     activeWeeks,
+			ActiveMonths:    activeMonths,
 			FirstRequestAt:  apiDateTimePtr(allTime.FirstRequestAt),
 			LastRequestAt:   apiDateTimePtr(allTime.LastRequestAt),
 			LastGeneratedAt: apiDateTimePtr(bucket.generatedAt),
 			Today:           keeperUsageStatsMetricResponseFrom(bucket.days[keeperStatsPeriodKey(today)]),
 			Yesterday:       keeperUsageStatsMetricResponseFrom(bucket.days[keeperStatsPeriodKey(yesterday)]),
+			ThisMonth:       keeperUsageStatsMetricResponseFrom(bucket.months[keeperStatsPeriodKey(thisMonth)]),
 			ThisWeek:        keeperUsageStatsMetricResponseFrom(bucket.weeks[keeperStatsPeriodKey(thisWeek)]),
 			LastWeek:        keeperUsageStatsMetricResponseFrom(bucket.weeks[keeperStatsPeriodKey(lastWeek)]),
 			TwoWeeksAgo:     keeperUsageStatsMetricResponseFrom(bucket.weeks[keeperStatsPeriodKey(twoWeeksAgo)]),
@@ -749,6 +779,9 @@ func keeperUsageStatsPeriodResponseFrom(period keeperUsageStatsPeriod) keeperUsa
 
 func keeperUsageStatsPeriodLabel(period keeperUsageStatsPeriod) string {
 	start := period.PeriodStart.In(appTimeLocation)
+	if period.PeriodType == "month" {
+		return start.Format("2006-01")
+	}
 	if period.PeriodType == "week" {
 		end := period.PeriodEnd.In(appTimeLocation).AddDate(0, 0, -1)
 		return start.Format("2006-01-02") + " 至 " + end.Format("2006-01-02")
@@ -768,6 +801,11 @@ func keeperStatsStartOfWeek(value time.Time) time.Time {
 		weekday = 7
 	}
 	return day.AddDate(0, 0, -(weekday - 1))
+}
+
+func keeperStatsStartOfMonth(value time.Time) time.Time {
+	local := value.In(appTimeLocation)
+	return time.Date(local.Year(), local.Month(), 1, 0, 0, 0, 0, appTimeLocation)
 }
 
 func keeperStatsPeriodKey(value time.Time) string {

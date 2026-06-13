@@ -200,11 +200,13 @@ export interface CodexKeeperUsageStatsSummary {
   alive_weeks: number
   active_days: number
   active_weeks: number
+  active_months: number
   first_request_at: string | null
   last_request_at: string | null
   last_generated_at: string | null
   today: CodexKeeperUsageStatsMetric
   yesterday: CodexKeeperUsageStatsMetric
+  this_month: CodexKeeperUsageStatsMetric
   this_week: CodexKeeperUsageStatsMetric
   last_week: CodexKeeperUsageStatsMetric
   two_weeks_ago: CodexKeeperUsageStatsMetric
@@ -212,7 +214,7 @@ export interface CodexKeeperUsageStatsSummary {
 }
 
 export interface CodexKeeperUsageStatsPeriod extends CodexKeeperUsageStatsMetric {
-  period_type: 'day' | 'week'
+  period_type: 'day' | 'week' | 'month'
   period_start: string
   period_end: string
   label: string
@@ -226,6 +228,7 @@ export interface CodexKeeperAccountUsageStats {
   summary: CodexKeeperUsageStatsSummary
   daily: CodexKeeperUsageStatsPeriod[]
   weekly: CodexKeeperUsageStatsPeriod[]
+  monthly: CodexKeeperUsageStatsPeriod[]
 }
 
 export interface CodexKeeperAccount {
